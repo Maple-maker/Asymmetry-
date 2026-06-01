@@ -10,7 +10,7 @@ set -euo pipefail
 
 TITLE="${1:-Asymmetry Radar}"
 BODY="${2:-No message provided}"
-PROJECT_ID="lmgphebvungyqsnqitcg"
+PROJECT_ID="jmtkygwvmrolfvwueggs"
 
 # Escape single quotes for SQL
 SAFE_TITLE="${TITLE//\'/\'\'}"

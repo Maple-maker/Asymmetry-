@@ -1,5 +1,5 @@
 // Deployed via Supabase MCP — see deploy history in AEGIS project
-// Function: radar-scan | Project: lmgphebvungyqsnqitcg
+// Function: radar-scan | Project: jmtkygwvmrolfvwueggs
 // Schedule: every 6 hours via pg_cron (0 0,6,12,18 * * *)
 //
 // To redeploy: use Supabase MCP deploy_edge_function tool

@@ -289,7 +289,7 @@ When a Tier 1 or high-conviction Tier 2 opportunity is identified, send a Telegr
 
 ### Alert delivery
 
-Use the Supabase MCP tool `execute_sql` on project `lmgphebvungyqsnqitcg` to call the `notify_ntfy` function. This routes through PostgreSQL → pg_net → ntfy.sh → your phone. No curl or outbound HTTP needed from the session.
+Use the Supabase MCP tool `execute_sql` on project `jmtkygwvmrolfvwueggs` to call the `notify_ntfy` function. This routes through PostgreSQL → pg_net → ntfy.sh → your phone. No curl or outbound HTTP needed from the session.
 
 ```sql
 SELECT notify_ntfy('Alert title here', 'Message body here');
