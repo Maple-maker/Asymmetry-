@@ -200,23 +200,100 @@ Present findings in this order:
 
 ## Notifications
 
-When a Tier 1 or high-conviction Tier 2 opportunity is identified, send a push notification immediately using the `PushNotification` tool. Do not wait for the full report to be written.
+When a Tier 1 or high-conviction Tier 2 opportunity is identified, send a Telegram alert immediately via the relay function. Do not wait for the full report to be written — alert first, then generate the deep research report, then send that too.
 
-**Notification format:**
+### Alert delivery
+
+Use `notify.sh` (at repo root) or call the Supabase relay directly with `curl`:
+
+```bash
+curl -s -X POST "https://lmgphebvungyqsnqitcg.supabase.co/functions/v1/telegram-notify" \
+  -H "Content-Type: application/json" \
+  -H "x-notify-secret: ${NOTIFY_SECRET}" \
+  -d "{\"messages\": [\"YOUR MESSAGE HERE\"]}"
+```
+
+### Message format — Tier 1 / Tier 2 alert (send first)
 
 ```
-[TIER 1] TICKER — one-line thesis. Asymmetry X/10. Catalyst: [event]. Investigate now.
+🔺 [TIER 1] $TICKER — Company Name
+
+Thesis: One sentence capturing the entire idea.
+
+Asymmetry:        X/10
+Conviction:       X/10
+Catalyst Strength: X/10
+Management:       X/10
+
+Catalyst: Specific event that reprices the stock
+Missing:  What the market hasn't priced in yet
+
+→ Full report incoming.
 ```
 
-**When to notify:**
-- Tier 1 discovery (always)
+### Message format — Full analysis (send as follow-up messages)
+
+Break the deep research report into separate Telegram messages:
+
+**Message 1 — Business Model & Moat**
+```
+📊 $TICKER — Business Model & Moat
+
+[Business model summary]
+
+Top 3 competitors: X, Y, Z
+Durable edge: [specific moat or lack thereof]
+```
+
+**Message 2 — Catalysts & Asymmetry**
+```
+⚡ $TICKER — Catalysts (Next 12 Months)
+
+• [Catalyst 1]
+• [Catalyst 2]
+• [Catalyst 3]
+
+Floor: $XX (bear case)
+Ceiling: $XX (bull case)
+Verdict: [skewed enough to act / not yet]
+```
+
+**Message 3 — Peer Comparison**
+```
+📐 $TICKER vs Peers
+
+Metric        | $TICKER | Peer 1 | Peer 2
+P/S TTM       |         |        |
+P/S Fwd       |         |        |
+P/FCF         |         |        |
+EV/EBITDA     |         |        |
+Gross Margin  |         |        |
+YoY Rev Growth|         |        |
+Value/Growth  |         |        |
+
+Verdict: [who wins on value vs growth]
+```
+
+**Message 4 — Bear Case**
+```
+🐻 $TICKER — Bear Case
+
+Red Flag #1 (High): [description] — Source: [filing/date]
+Red Flag #2 (Medium): [description] — Source: [filing/date]
+Red Flag #3 (Low): [description] — Source: [filing/date]
+
+Bear Case Verdict: [does bull thesis hold?]
+```
+
+### When to notify
+
+- Tier 1 discovery (always — immediately)
 - Tier 2 with Catalyst Strength ≥ 8 (always)
 - Tier 2 with all four scores ≥ 7 (always)
 - Tier 3 entries (do not notify — add to watchlist silently)
 
-**When not to notify:**
+### When not to notify
+
 - Routine research in progress
 - Ideas that fail the minimum criteria
 - Anything that belongs on a watchlist rather than the radar
-
-The notification pulls attention away from whatever else is happening. Reserve it for ideas that genuinely warrant immediate investigation.
