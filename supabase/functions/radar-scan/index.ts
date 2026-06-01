@@ -126,9 +126,12 @@ function quantScore(s: Record<string, any>): number {
 
 // ── Gemini analysis ───────────────────────────────────────────────────────────
 
-async function geminiAnalyze(ticker: string, snap: Record<string, any>): Promise<string> {
+async function geminiAnalyze(ticker: string, snap: Record<string, any>, memory = ""): Promise<string> {
   if (!GEMINI_KEY) return "GEMINI_API_KEY not set.";
-  const prompt = `You are a quantitative research analyst for the Asymmetry Opportunity Radar.
+  const memorySection = memory
+    ? `\n\n## Agent Memory — Context From Prior Scans\nUse this to identify connections to existing themes and avoid re-surfacing ideas already well-covered:\n${memory}\n`
+    : "";
+  const prompt = `You are a quantitative research analyst for the Asymmetry Opportunity Radar.${memorySection}
 Mission: find asymmetric upside in LESSER-KNOWN or BEATEN-DOWN stocks that institutional capital has ignored.
 Analyze ${ticker} using this live market data:
 ${JSON.stringify(snap, null, 2)}
@@ -491,6 +494,174 @@ ${compVsHtml}
 </body></html>`;
 }
 
+// ── Markdown report (Obsidian) ────────────────────────────────────────────────
+
+function generateMarkdown(
+  ticker: string, p: ReturnType<typeof parseGemini>,
+  snap: Record<string, any>, qScore: number
+): string {
+  const date     = new Date().toISOString().slice(0, 10);
+  const tierLbl  = p.tier === 1 ? "Tier 1 — Exceptional" : p.tier === 2 ? "Tier 2 — High Conviction" : "Tier 3 — Watchlist";
+  const up       = p.target_price && snap.price ? (((p.target_price - snap.price) / snap.price) * 100).toFixed(0) : "—";
+  const dn       = p.floor_price  && snap.price ? (((snap.price - p.floor_price)  / snap.price) * 100).toFixed(0) : "—";
+  const bm       = p.bull_price   && snap.price ? `${(p.bull_price / snap.price).toFixed(1)}x` : "—";
+  const s        = p.scores;
+
+  const catsSection = p.catalysts.map((c, i) => `${i + 1}. **${c.event}** — ${c.timing}`).join("\n");
+  const compVsSection = p.competitor_vs.length > 0
+    ? p.competitor_vs.map(c => `### ${c.name}\n${c.vs}`).join("\n\n")
+    : "*No comparison data.*";
+
+  const tags = ["asymmetry-radar", `tier-${p.tier}`];
+  if (snap.insider_signal === "BUY") tags.push("insider-buy");
+  if ((snap.revenue_growth ?? 0) > 0.3) tags.push("high-growth");
+  if ((snap.market_cap ?? 1e12) < 2e9) tags.push("small-cap");
+
+  return `---
+ticker: ${ticker}
+tier: ${p.tier}
+overall_score: ${p.overall}
+quant_score: ${qScore}
+asymmetry: ${s.asymmetry}
+conviction: ${s.conviction}
+catalyst: ${s.catalyst}
+management: ${s.management}
+price: ${snap.price ?? ""}
+floor_price: ${p.floor_price || ""}
+target_price: ${p.target_price || ""}
+bull_price: ${p.bull_price || ""}
+revenue_growth: ${snap.revenue_growth ?? ""}
+gross_margin: ${snap.gross_margin ?? ""}
+insider_signal: ${snap.insider_signal}
+date: ${date}
+status: active
+tags: [${tags.join(", ")}]
+---
+
+# $${ticker} — ${tierLbl}
+> **${p.thesis}**
+> *Asymmetry Radar · ${date}*
+
+---
+
+## Asymmetry Model
+
+| | Bear | Base | Bull |
+|---|---|---|---|
+| **Price** | $${p.floor_price || "—"} | $${p.target_price || "—"} | $${p.bull_price || "—"} |
+| **Change** | −${dn}% | +${up}% | ${bm} |
+
+## Conviction Scores
+
+| Dimension | Score |
+|---|---|
+| Asymmetry | ${s.asymmetry}/10 |
+| Conviction | ${s.conviction}/10 |
+| Catalyst Strength | ${s.catalyst}/10 |
+| Management Quality | ${s.management}/10 |
+| **Overall** | **${p.overall}/100** |
+
+## Key Metrics
+
+| Metric | Value |
+|---|---|
+| Price | $${snap.price ?? "N/A"} |
+| Market Cap | ${snap.market_cap ? `$${(snap.market_cap / 1e6).toFixed(0)}M` : "N/A"} |
+| Revenue Growth YoY | ${snap.revenue_growth != null ? `${(snap.revenue_growth * 100).toFixed(1)}%` : "N/A"} |
+| Gross Margin | ${snap.gross_margin != null ? `${(snap.gross_margin * 100).toFixed(1)}%` : "N/A"} |
+| P/S TTM | ${snap.ps_ttm != null ? `${snap.ps_ttm.toFixed(1)}x` : "N/A"} |
+| Insider Signal | ${snap.insider_signal} (${snap.insider_buys}B / ${snap.insider_sells}S) |
+| Quant Score | ${qScore}/100 |
+
+---
+
+## Business Model
+
+${p.business_model}
+
+**Revenue Streams:** ${p.revenue_streams.join(" · ")}
+
+**Competitors:** ${p.competitors.map(c => `[[${c}]]`).join(" · ")}
+
+**Moat:** ${p.moat}
+
+---
+
+## Bull Case ▲ — What Has to Go Right
+
+${p.bull_case}
+
+## Bear Case ▼ — What Could Go Wrong
+
+${p.bear_case}
+
+---
+
+## Catalysts — Next 12 Months
+
+${catsSection || "*No catalysts identified.*"}
+
+---
+
+## Competitor Analysis
+
+${compVsSection}
+
+---
+
+## ⚠️ Invalidation Trigger
+
+> ${p.invalidation}
+
+---
+
+## Full Analysis
+
+${p.analysis}
+
+---
+
+*Asymmetry Opportunity Radar · ${date} · Not investment advice.*
+`;
+}
+
+// ── Agent memory ──────────────────────────────────────────────────────────────
+
+async function readMemory(): Promise<string> {
+  const { data } = await supabase.from("radar_memory")
+    .select("content").eq("key", "agent_context").single();
+  return data?.content ?? "";
+}
+
+async function updateMemory(ticker: string, p: ReturnType<typeof parseGemini>, snap: Record<string, any>) {
+  const current = await readMemory();
+  const date    = new Date().toISOString().slice(0, 10);
+  const entry   = `- **$${ticker}** (Tier ${p.tier}, ${p.overall}/100) — ${p.thesis} [${date}]`;
+
+  let updated = current;
+  if (p.tier <= 2) {
+    if (updated.includes("## Active Themes")) {
+      updated = updated.replace(
+        /## Active Themes\n(\*.*?\*|.*?)(\n\n|$)/s,
+        `## Active Themes\n${entry}\n$2`
+      );
+    }
+  }
+
+  const outcomeNote = `- $${ticker}: Tier ${p.tier} | Score ${p.overall} | Target $${p.target_price || "—"} | Invalidation: ${p.invalidation} [scanned ${date}]`;
+  if (updated.includes("## Recent Outcomes")) {
+    const lines = updated.split("\n");
+    const idx   = lines.findIndex(l => l.startsWith("## Recent Outcomes"));
+    if (idx >= 0) {
+      lines.splice(idx + 1, 0, outcomeNote);
+      updated = lines.join("\n");
+    }
+  }
+
+  await supabase.from("radar_memory")
+    .upsert({ key: "agent_context", content: updated, updated_at: new Date().toISOString() });
+}
+
 // ── Notification ──────────────────────────────────────────────────────────────
 
 async function notify(title: string, body: string, priority = 4) {
@@ -541,7 +712,8 @@ Deno.serve(async (req: Request) => {
   let tickersScanned = 0, oppsFound = 0;
   const errors: string[] = [];
 
-  const auth = await getYFAuth();
+  const auth   = await getYFAuth();
+  const memory = await readMemory();
 
   if (diagMode) {
     const ticker = body.ticker ?? "CODA";
@@ -579,7 +751,7 @@ Deno.serve(async (req: Request) => {
       const qScore = quantScore(snap);
       if (!testMode && qScore < 55) continue;
 
-      const geminiText = await geminiAnalyze(ticker, snap);
+      const geminiText = await geminiAnalyze(ticker, snap, memory);
       const parsed     = parseGemini(geminiText);
 
       const shouldNotify = testMode ||
@@ -591,12 +763,15 @@ Deno.serve(async (req: Request) => {
       oppsFound++;
 
       const html = generateHtml(ticker, parsed, snap, qScore);
+      const mdReport = generateMarkdown(ticker, parsed, snap, qScore);
+
+      await updateMemory(ticker, parsed, snap);
 
       const { data: oppRow } = await supabase.from("radar_opportunities").insert({
         ticker, tier: parsed.tier, overall_score: parsed.overall,
         quant_score: qScore, thesis: parsed.thesis,
         gemini_analysis: geminiText, data_snapshot: snap,
-        report_html: html, notified: true,
+        report_html: html, report_md: mdReport, notified: true,
       }).select("id").single();
 
       const rowId = oppRow?.id;
