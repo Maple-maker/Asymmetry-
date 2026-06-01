@@ -212,87 +212,153 @@ SELECT notify_ntfy('Alert title here', 'Message body here');
 
 Priority scale: 5 = max urgency, 4 = high (default), 3 = normal, 2 = low.
 
-### Message format — Tier 1 / Tier 2 alert (send first)
+### Notification formatting principles
+
+Every message must be visually scannable in under 10 seconds. Lead with numbers. Use progress bars for scores. Color-code severity. Make the invalidation trigger explicit — it is the most actionable line in the report.
+
+---
+
+### Message 1 — Alert (send immediately on discovery)
 
 ```
-🔺 [TIER 1] $TICKER — Company Name
+🔺 TIER 1 — $TICKER  |  Company Name
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📌 THESIS
+[One sentence. The entire idea.]
 
-Thesis: One sentence capturing the entire idea.
+💰 ASYMMETRY
+  Entry:    $XX.XX
+  Target:   $XX.XX  (+XXX%)
+  Floor:    $XX.XX  (-XX%)
+  Horizon:  12–18 months
 
-Asymmetry:        X/10
-Conviction:       X/10
-Catalyst Strength: X/10
-Management:       X/10
+📊 CONVICTION SCORES
+  Asymmetry      ████████░░  8/10
+  Conviction     █████████░  9/10
+  Catalyst       ████████░░  8/10
+  Management     ███████░░░  7/10
+  ─────────────────────────
+  OVERALL        82/100
 
-Catalyst: Specific event that reprices the stock
-Missing:  What the market hasn't priced in yet
+⚡ CATALYST
+  [Specific event] — Est. [quarter/date]
 
-→ Full report incoming.
+🎯 MARKET MISS
+  [What the market hasn't priced in]
+
+→ Full report: 4 messages incoming.
 ```
 
-### Message format — Full analysis (send as follow-up messages)
+---
 
-Break the deep research report into separate Telegram messages:
+### Message 2 — Business Model & Moat
 
-**Message 1 — Business Model & Moat**
 ```
-📊 $TICKER — Business Model & Moat
+📊 $TICKER — Business Model
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+HOW THEY MAKE MONEY
+[2–3 sentences. Plain English. Revenue streams.]
 
-[Business model summary]
+KEY METRICS
+  Revenue (TTM):     $XXB
+  Gross Margin:      XX%
+  YoY Growth:        XX%
+  Cash / Debt:       $XXM / $XXM
 
-Top 3 competitors: X, Y, Z
-Durable edge: [specific moat or lack thereof]
+MOAT
+  Top rivals: [Peer 1] · [Peer 2] · [Peer 3]
+  Edge: [Patent / switching cost / network effect / data]
+  Durability: [Can rivals copy this in 3–5 years? Yes/No + why]
 ```
 
-**Message 2 — Catalysts & Asymmetry**
+---
+
+### Message 3 — Catalysts & Asymmetry
+
 ```
 ⚡ $TICKER — Catalysts (Next 12 Months)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ① [Catalyst] — [Est. timing]
+  ② [Catalyst] — [Est. timing]
+  ③ [Catalyst] — [Est. timing]
 
-• [Catalyst 1]
-• [Catalyst 2]
-• [Catalyst 3]
+ASYMMETRY MODEL
+  ┌─────────────────────────────┐
+  │ BEAR   $XX  │ BASE   $XX   │
+  │ -XX%       │ +XXX%        │
+  ├─────────────────────────────┤
+  │ BULL   $XX  │ CONVICTION   │
+  │ +XXXx      │     82/100   │
+  └─────────────────────────────┘
 
-Floor: $XX (bear case)
-Ceiling: $XX (bull case)
-Verdict: [skewed enough to act / not yet]
+VERDICT
+  [Skewed enough to act / Not yet — one sentence]
 ```
 
-**Message 3 — Peer Comparison**
+---
+
+### Message 4 — Peer Comparison
+
 ```
 📐 $TICKER vs Peers
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Metric          $TICKER   Peer 1   Peer 2
+──────────────────────────────────────────
+P/S (TTM)
+P/S (Fwd)
+P/FCF
+EV/EBITDA
+Gross Margin
+YoY Rev Growth
+Value/Growth*
 
-Metric        | $TICKER | Peer 1 | Peer 2
-P/S TTM       |         |        |
-P/S Fwd       |         |        |
-P/FCF         |         |        |
-EV/EBITDA     |         |        |
-Gross Margin  |         |        |
-YoY Rev Growth|         |        |
-Value/Growth  |         |        |
+*P/S TTM ÷ YoY Rev Growth — lower = better
 
-Verdict: [who wins on value vs growth]
+VERDICT
+  Best value/growth: [$TICKER or peer]
+  [Flag any outlier — discount despite superior growth]
 ```
 
-**Message 4 — Bear Case**
+---
+
+### Message 5 — Bear Case
+
 ```
 🐻 $TICKER — Bear Case
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🔴 RED FLAG #1 — [HIGH]
+  [Description]
+  Source: [Filing / transcript / date]
 
-Red Flag #1 (High): [description] — Source: [filing/date]
-Red Flag #2 (Medium): [description] — Source: [filing/date]
-Red Flag #3 (Low): [description] — Source: [filing/date]
+🟡 RED FLAG #2 — [MEDIUM]
+  [Description]
+  Source: [Filing / transcript / date]
 
-Bear Case Verdict: [does bull thesis hold?]
+🟢 RED FLAG #3 — [LOW]
+  [Description]
+  Source: [Filing / transcript / date]
+
+VERDICT
+  [Does bull thesis hold? One sentence.]
+
+⚠️ INVALIDATION TRIGGER
+  [Exact condition that breaks the thesis — e.g.
+  "MI300X FY26 guidance cut below $10B OR gross
+  margin compression below 48% for 2 consecutive
+  quarters. Either = exit."]
 ```
+
+---
 
 ### When to notify
 
-- Tier 1 discovery (always — immediately)
-- Tier 2 with Catalyst Strength ≥ 8 (always)
-- Tier 2 with all four scores ≥ 7 (always)
-- Tier 3 entries (do not notify — add to watchlist silently)
+- Tier 1 discovery — always, immediately
+- Tier 2 with Catalyst Strength ≥ 8 — always
+- Tier 2 with all four scores ≥ 7 — always
+- Tier 3 — do not notify, add to watchlist silently
 
 ### When not to notify
 
 - Routine research in progress
-- Ideas that fail the minimum criteria
+- Ideas that fail minimum criteria
 - Anything that belongs on a watchlist rather than the radar
