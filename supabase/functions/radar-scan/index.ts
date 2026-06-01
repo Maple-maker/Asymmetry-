@@ -1,6 +1,6 @@
 // Deployed via Supabase MCP — see deploy history in AEGIS project
-// Function: radar-scan | Project: jmtkygwvmrolfvwueggs | Version: 13
-// Schedule: every 6 hours via pg_cron (0 0,6,12,18 * * *)
+// Function: radar-scan | Project: jmtkygwvmrolfvwueggs | Version: 17
+// Schedule: 3x daily via pg_cron (0 7,13,19 * * *) — 7am, 1pm, 7pm UTC
 // Data: Yahoo Finance (crumb auth) — all tickers, no API key required
 // Reports: HTML stored in radar_opportunities.report_html → served by report-viewer edge fn
 //
@@ -665,6 +665,36 @@ async function updateMemory(ticker: string, p: ReturnType<typeof parseGemini>, s
     );
 }
 
+// ── GitHub vault push ─────────────────────────────────────────────────────────
+
+async function pushToGitHub(path: string, content: string, message: string): Promise<void> {
+  const token  = Deno.env.get("GITHUB_TOKEN");
+  if (!token) return;
+  const repo   = Deno.env.get("GITHUB_REPO")   ?? "maple-maker/aegis-intel-vault";
+  const branch = Deno.env.get("GITHUB_BRANCH") ?? "main";
+  const apiUrl = `https://api.github.com/repos/${repo}/contents/${path}`;
+  const hdrs   = {
+    "Authorization": `Bearer ${token}`,
+    "Accept": "application/vnd.github.v3+json",
+    "User-Agent": "asymmetry-radar",
+    "Content-Type": "application/json",
+  };
+
+  let sha: string | undefined;
+  try {
+    const r = await fetch(`${apiUrl}?ref=${branch}`, { headers: hdrs });
+    if (r.ok) sha = (await r.json()).sha;
+  } catch { /* new file */ }
+
+  const body: Record<string, any> = {
+    message, branch,
+    content: btoa(unescape(encodeURIComponent(content))),
+  };
+  if (sha) body.sha = sha;
+
+  await fetch(apiUrl, { method: "PUT", headers: hdrs, body: JSON.stringify(body) });
+}
+
 // ── Notification ──────────────────────────────────────────────────────────────
 
 async function notify(title: string, body: string, priority = 4) {
@@ -757,18 +787,29 @@ Deno.serve(async (req: Request) => {
       const geminiText = await geminiAnalyze(ticker, snap, memory);
       const parsed     = parseGemini(geminiText);
 
-      const shouldNotify = testMode ||
-        parsed.tier === 1 ||
-        (parsed.tier === 2 && parsed.scores.catalyst >= 8) ||
-        (parsed.tier === 2 && Object.values(parsed.scores).every(v => v >= 7));
+      // Quality gate: 75+ overall score, Tier 1 or 2 only
+      const shouldNotify = testMode || (parsed.overall >= 75 && parsed.tier <= 2);
 
       if (!shouldNotify) continue;
       oppsFound++;
 
-      const html = generateHtml(ticker, parsed, snap, qScore);
+      const html     = generateHtml(ticker, parsed, snap, qScore);
       const mdReport = generateMarkdown(ticker, parsed, snap, qScore);
+      const scanDate = new Date().toISOString().slice(0, 10);
 
       await updateMemory(ticker, parsed, snap);
+
+      // Push markdown to GitHub → Obsidian vault auto-pulls
+      const mdPath = `vault/opportunities/${ticker}_${scanDate}.md`;
+      await pushToGitHub(
+        mdPath, mdReport,
+        `scan: $${ticker} Tier ${parsed.tier} ${parsed.overall}/100 [${scanDate}]`
+      );
+      const updatedMemory = await readMemory();
+      await pushToGitHub(
+        "vault/_memory/agent_context.md", updatedMemory,
+        `memory: update after $${ticker} scan [${scanDate}]`
+      );
 
       const { data: oppRow } = await supabase.from("radar_opportunities").insert({
         ticker, tier: parsed.tier, overall_score: parsed.overall,
