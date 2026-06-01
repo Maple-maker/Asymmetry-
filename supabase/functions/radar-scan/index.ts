@@ -16,7 +16,8 @@ const NTFY_TOPIC   = "asymmetry-radar";
 const GEMINI_MODEL = "gemini-2.5-flash";
 const GEMINI_BASE  = "https://generativelanguage.googleapis.com/v1beta";
 const YF_UA        = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
-const REPORT_BASE  = "https://jmtkygwvmrolfvwueggs.supabase.co/functions/v1/report-viewer";
+const ANON_KEY     = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImptdGt5Z3d2bXJvbGZ2d3VlZ2dzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODAzMzAxODUsImV4cCI6MjA5NTkwNjE4NX0.JUbsLc_KHHdfXWDSAl9Rf00Da-axpSj4Nw4DvXGNBvk";
+const REPORT_BASE  = `https://jmtkygwvmrolfvwueggs.supabase.co/functions/v1/report-viewer?apikey=${ANON_KEY}`;
 
 const supabase = createClient(
   Deno.env.get("SUPABASE_URL")!,
@@ -599,7 +600,7 @@ Deno.serve(async (req: Request) => {
       }).select("id").single();
 
       const rowId = oppRow?.id;
-      const reportUrl = rowId ? `${REPORT_BASE}?id=${rowId}` : null;
+      const reportUrl = rowId ? `${REPORT_BASE}&id=${rowId}` : null;
 
       if (rowId && reportUrl) {
         await supabase.from("radar_opportunities")
