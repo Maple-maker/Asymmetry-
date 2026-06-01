@@ -659,7 +659,10 @@ async function updateMemory(ticker: string, p: ReturnType<typeof parseGemini>, s
   }
 
   await supabase.from("radar_memory")
-    .upsert({ key: "agent_context", content: updated, updated_at: new Date().toISOString() });
+    .upsert(
+      { key: "agent_context", content: updated, updated_at: new Date().toISOString() },
+      { onConflict: "key" }
+    );
 }
 
 // ── Notification ──────────────────────────────────────────────────────────────
