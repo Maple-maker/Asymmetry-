@@ -185,6 +185,91 @@ Prioritize primary sources:
 
 ---
 
+## Multi-Agent Architecture
+
+This radar runs on two agents with clearly divided responsibilities:
+
+| Layer | Agent | Role |
+|---|---|---|
+| Orchestration & code | **Claude Code** | Runs the radar engine, fetches live data, scores opportunities, generates reports, fires notifications |
+| Deep document research | **Gemini** | Processes 10-Ks, earnings transcripts, PDFs that exceed normal context — surfaces non-consensus signals |
+
+### Environment Variables Required
+
+```bash
+FMP_API_KEY=7zot0VBOVSFapJxpfSocu1NWplDLTXKx   # Financial Modeling Prep — live stock data
+GEMINI_API_KEY=<your-google-ai-studio-key>         # Gemini 1.5 Pro — large document analysis
+```
+
+### Live Stock Data (FMP Client)
+
+For every opportunity, pull real data before scoring:
+
+```bash
+python3 tools/fmp_client.py TICKER
+```
+
+Or in Python:
+```python
+from tools.fmp_client import get_radar_snapshot
+snap = get_radar_snapshot("TICKER")
+# Returns: price, market_cap, ps_ttm, p_fcf, ev_ebitda, gross_margin,
+#          revenue_growth_yoy, analyst_count, insider_signal, peers, news
+```
+
+Use `snap` data to populate all seven analysis questions and the peer comparison table with real numbers, not estimates.
+
+### Gemini Research Subagent
+
+For large document analysis (10-Ks, earnings call transcripts, PDFs):
+
+```bash
+# Analyze a document
+python3 tools/gemini_query.py TICKER "What risk factors has management flagged?" path/to/10k.pdf
+
+# Quick query (no file upload)
+echo "Summarize AMD's MI300X competitive position in 3 bullet points" | python3 tools/gemini_query.py
+```
+
+Delegate to Gemini when:
+- Parsing a document longer than 100 pages
+- Analyzing an earnings call transcript for tone/guidance shifts
+- Comparing multi-year 10-K language for strategy changes
+- Identifying non-consensus signals buried in footnotes
+
+### HTML Report Generation
+
+Every Tier 1 or Tier 2 finding must produce an HTML report **in addition to** the ntfy notification:
+
+```python
+from tools.report import generate_html_report, save_report
+
+data = {
+    "ticker": "TICK", "company_name": "...", "tier": 1,
+    "thesis": "...",
+    "price": 42.0, "target_price": 120, "floor_price": 30,
+    "upside_pct": 185, "downside_pct": 28,
+    "bull_ceiling": 200, "bull_multiple": "4.7x",
+    "scores": {"asymmetry": 9, "conviction": 8, "catalyst": 8, "management": 7},
+    "overall_score": 85,
+    "business_model": "...", "moat": "...",
+    "competitors": ["Peer1", "Peer2", "Peer3"],
+    "catalysts": [{"event": "...", "timing": "Q3 2026"}],
+    "peers": [{"name": "Peer1", "ps_ttm": 3.2, "gross_margin": 0.45, "rev_growth": 0.22}],
+    "red_flags": [{"severity": "High", "title": "...", "description": "...", "source": "..."}],
+    "invalidation_trigger": "...",
+    "asymmetry_verdict": "...",
+    "snapshot": snap,  # from get_radar_snapshot()
+}
+html = generate_html_report(data)
+path = save_report(html, "TICK")
+# Report saved to reports/TICK_YYYYMMDD_HHMM.html
+```
+
+The HTML report is the deliverable. The ntfy notification is the interrupt. Send both.
+
+---
+
 ## Output Format
 
 Present findings in this order:
