@@ -1,5 +1,5 @@
 // Deployed via Supabase MCP — see deploy history in AEGIS project
-// Function: radar-scan | Project: jmtkygwvmrolfvwueggs | Version: 17
+// Function: radar-scan | Project: jmtkygwvmrolfvwueggs | Version: 19
 // Schedule: 3x daily via pg_cron (0 7,13,19 * * *) — 7am, 1pm, 7pm UTC
 // Data: Yahoo Finance (crumb auth) — all tickers, no API key required
 // Reports: HTML stored in radar_opportunities.report_html → served by report-viewer edge fn
@@ -787,8 +787,8 @@ Deno.serve(async (req: Request) => {
       const geminiText = await geminiAnalyze(ticker, snap, memory);
       const parsed     = parseGemini(geminiText);
 
-      // Quality gate: 75+ overall score, Tier 1 or 2 only
-      const shouldNotify = testMode || (parsed.overall >= 75 && parsed.tier <= 2);
+      // Quality gate: 75+ overall score, Tier 1 or 2 only — always enforced
+      const shouldNotify = parsed.overall >= 75 && parsed.tier <= 2;
 
       if (!shouldNotify) continue;
       oppsFound++;
