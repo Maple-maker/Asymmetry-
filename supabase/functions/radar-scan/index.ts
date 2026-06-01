@@ -1,8 +1,8 @@
 // Deployed via Supabase MCP — see deploy history in AEGIS project
-// Function: radar-scan | Project: jmtkygwvmrolfvwueggs | Version: 12
+// Function: radar-scan | Project: jmtkygwvmrolfvwueggs | Version: 13
 // Schedule: every 6 hours via pg_cron (0 0,6,12,18 * * *)
 // Data: Yahoo Finance (crumb auth) — all tickers, no API key required
-// Reports: auto-generated HTML → Supabase Storage bucket "reports" → public URL in ntfy
+// Reports: HTML stored in radar_opportunities.report_html → served by report-viewer edge fn
 //
 // Diagnostic: POST {"diag":true}
 // Test:       POST {"test":true,"tickers":["CODA"]}
@@ -16,6 +16,7 @@ const NTFY_TOPIC   = "asymmetry-radar";
 const GEMINI_MODEL = "gemini-2.5-flash";
 const GEMINI_BASE  = "https://generativelanguage.googleapis.com/v1beta";
 const YF_UA        = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
+const REPORT_BASE  = "https://jmtkygwvmrolfvwueggs.supabase.co/functions/v1/report-viewer";
 
 const supabase = createClient(
   Deno.env.get("SUPABASE_URL")!,
@@ -151,17 +152,20 @@ Also provide:
 - MOAT: 1-2 sentences on competitive edge
 - COMPETITORS: comma-separated list of top 3 rivals
 - CATALYSTS: pipe-separated as "event1|timing1|event2|timing2|event3|timing3"
-- FLOOR_PRICE: bear case price number
-- TARGET_PRICE: base case price number
-- BULL_PRICE: bull case price number
+- FLOOR_PRICE: bear case price as a plain number only
+- TARGET_PRICE: base case price as a plain number only
+- BULL_PRICE: bull case price as a plain number only
 - INVALIDATION: one sentence — exact condition that breaks the thesis
+- BULL_CASE: 2-3 plain English sentences explaining why this stock could go up a lot — no finance jargon, write for someone who has never invested before, explain what has to go right
+- BEAR_CASE: 2-3 plain English sentences explaining the main risks — no finance jargon, write for someone who has never invested before, explain what could go wrong and why the stock might lose value
+- COMPETITOR_VS: for each competitor write "Name::2-sentence comparison of how ${ticker} stacks up against them" — separate competitors with three pipes like "|||" — do NOT use the "|" character inside any comparison text
 
 Score 1-10: Asymmetry, Conviction, Catalyst Strength, Management Quality.
 Tier 1=10x+ exceptional, 2=3-10x solid, 3=watchlist only.
 
-Respond in EXACTLY this format:
+Respond in EXACTLY this format (one field per line):
 TIER: [1/2/3]
-THESIS: [one sentence — the entire idea]
+THESIS: [one sentence]
 ASYMMETRY: [X/10]
 CONVICTION: [X/10]
 CATALYST: [X/10]
@@ -176,6 +180,9 @@ FLOOR_PRICE: [number]
 TARGET_PRICE: [number]
 BULL_PRICE: [number]
 INVALIDATION: [text]
+BULL_CASE: [plain language text]
+BEAR_CASE: [plain language text]
+COMPETITOR_VS: [Name1::comparison text|||Name2::comparison text|||Name3::comparison text]
 ANALYSIS:
 [7-question analysis]`;
   try {
@@ -205,6 +212,12 @@ function parseGemini(text: string) {
     if (i % 2 === 0 && arr[i + 1]) acc.push({ event: v.trim(), timing: arr[i + 1].trim() });
     return acc;
   }, []);
+  const rawCompVs = get("COMPETITOR_VS") ?? "";
+  const compVs = rawCompVs.split("|||").map((s: string) => {
+    const idx = s.indexOf("::");
+    if (idx < 0) return { name: s.trim(), vs: "" };
+    return { name: s.slice(0, idx).trim(), vs: s.slice(idx + 2).trim() };
+  }).filter((c: any) => c.name && c.vs);
   return {
     tier:            parseInt(get("TIER") ?? "3"),
     thesis:          get("THESIS") ?? "",
@@ -224,11 +237,14 @@ function parseGemini(text: string) {
     target_price:    parseFloat(get("TARGET_PRICE") ?? "0"),
     bull_price:      parseFloat(get("BULL_PRICE")   ?? "0"),
     invalidation:    get("INVALIDATION") ?? "",
+    bull_case:       get("BULL_CASE") ?? "",
+    bear_case:       get("BEAR_CASE") ?? "",
+    competitor_vs:   compVs,
     analysis,
   };
 }
 
-// ── HTML report ───────────────────────────────────────────────────────────────
+// ── HTML helpers ──────────────────────────────────────────────────────────────
 
 function money(v: number | null) {
   if (!v) return "N/A";
@@ -237,8 +253,23 @@ function money(v: number | null) {
   return `$${(v / 1e6).toFixed(0)}M`;
 }
 function pct(v: number | null) { return v != null ? `${(v * 100).toFixed(1)}%` : "N/A"; }
-function fmt(v: number | null | undefined, s = "") { return v != null ? `${v.toFixed(1)}${s}` : "N/A"; }
+function fmt(v: number | null | undefined, sfx = "") { return v != null ? `${v.toFixed(1)}${sfx}` : "N/A"; }
 function bar(v: number) { return "█".repeat(Math.round(v)) + "░".repeat(10 - Math.round(v)); }
+function esc(s: string | null | undefined): string {
+  if (!s) return "";
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+function md(s: string | null | undefined): string {
+  if (!s) return "";
+  return esc(s)
+    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+    .replace(/\n/g, "<br>");
+}
 
 function generateHtml(
   ticker: string, p: ReturnType<typeof parseGemini>,
@@ -248,7 +279,7 @@ function generateHtml(
   const tier    = p.tier;
   const tc      = tier === 1 ? "#ef4444" : tier === 2 ? "#f97316" : "#eab308";
   const tierLbl = tier === 1 ? "TIER 1 — EXCEPTIONAL" : tier === 2 ? "TIER 2 — HIGH CONVICTION" : "TIER 3 — WATCHLIST";
-  const s       = p.scores;
+  const scores  = p.scores;
   const price   = snap.price;
   const up      = p.target_price && price ? (((p.target_price - price) / price) * 100).toFixed(0) : "—";
   const dn      = p.floor_price  && price ? (((price - p.floor_price)  / price) * 100).toFixed(0) : "—";
@@ -261,21 +292,36 @@ function generateHtml(
   const sRow = (label: string, val: number) =>
     `<div class="srow"><span class="slabel">${label}</span><span class="sbar">${bar(val)}</span><span class="sval">${val}/10</span></div>`;
 
-  const streams = p.revenue_streams.map(s => `<li>${s}</li>`).join("");
-  const comps   = p.competitors.map(c => `<span class="ctag">${c}</span>`).join("");
-  const cats    = p.catalysts.map((c, i) =>
-    `<div class="cat-row"><span class="cat-n">${i + 1}</span><div><div class="cat-event">${c.event}</div><div class="cat-timing">${c.timing}</div></div></div>`
+  const streams = p.revenue_streams.map((rs: string) => `<li>${esc(rs)}</li>`).join("");
+  const comps   = p.competitors.map((c: string) => `<span class="ctag">${esc(c)}</span>`).join("");
+  const cats    = p.catalysts.map((c: any, i: number) =>
+    `<div class="cat-row"><span class="cat-n">${i + 1}</span><div><div class="cat-event">${esc(c.event)}</div><div class="cat-timing">${esc(c.timing)}</div></div></div>`
   ).join("");
-  const analysisHtml = p.analysis
-    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
-    .replace(/\n/g, "<br>");
+  const analysisHtml = md(p.analysis);
+
+  const bullBearHtml = (p.bull_case || p.bear_case) ? [
+    `<h2>Bull Case vs Bear Case</h2>`,
+    `<div class="bc-grid">`,
+    `<div class="bc-box bullcase"><div class="bc-lbl">&#9650; Bull Case &mdash; What Has to Go Right</div><p>${md(p.bull_case)}</p></div>`,
+    `<div class="bc-box bearcase"><div class="bc-lbl">&#9660; Bear Case &mdash; What Could Go Wrong</div><p>${md(p.bear_case)}</p></div>`,
+    `</div>`,
+  ].join("") : "";
+
+  const compVsHtml = p.competitor_vs.length > 0 ? [
+    `<h2>Competitor Analysis</h2>`,
+    `<div class="comp-grid">`,
+    ...p.competitor_vs.map((c: any) =>
+      `<div class="comp-card"><div class="comp-name">${esc(c.name)}</div><p>${esc(c.vs)}</p></div>`
+    ),
+    `</div>`,
+  ].join("") : "";
 
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${ticker} — Asymmetry Radar</title>
+<title>${esc(ticker)} — Asymmetry Radar</title>
 <style>
 :root{--bg:#0c0c0e;--sf:#141417;--sf2:#1c1c20;--bd:#2a2a30;--tx:#e2e2e8;--mt:#6b6b7a;
   --ac:#00d4aa;--pos:#22c55e;--neg:#ef4444;--warn:#f97316;--tc:${tc};
@@ -334,12 +380,22 @@ p{color:#b0b0bc;font-size:13px;line-height:1.8}
 .bull .aprice,.bull .achg{color:var(--pos)}
 .vbox{background:var(--sf2);border:1px solid var(--bd);border-radius:8px;padding:18px 20px;margin-top:14px}
 .vlbl{font-size:9px;text-transform:uppercase;letter-spacing:2px;color:var(--ac);font-weight:700;margin-bottom:8px}
+.bc-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.bc-box{border:1px solid;border-radius:8px;padding:20px}
+.bc-box.bullcase{border-color:var(--pos);background:#081208}
+.bc-box.bearcase{border-color:var(--neg);background:#160808}
+.bc-lbl{font-size:9px;text-transform:uppercase;letter-spacing:2px;font-weight:700;margin-bottom:10px}
+.bc-box.bullcase .bc-lbl{color:var(--pos)}
+.bc-box.bearcase .bc-lbl{color:var(--neg)}
 .cat-row{display:flex;gap:16px;align-items:flex-start;padding:14px 0;border-bottom:1px solid var(--bd)}
 .cat-row:last-child{border-bottom:none}
 .cat-n{background:var(--ac);color:#000;font-size:9px;font-weight:800;
   padding:3px 8px;border-radius:10px;white-space:nowrap;margin-top:2px}
 .cat-event{font-size:13px;font-weight:600;margin-bottom:2px}
 .cat-timing{font-size:11px;color:var(--mt)}
+.comp-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px}
+.comp-card{background:var(--sf);border:1px solid var(--bd);border-radius:8px;padding:18px}
+.comp-name{font-size:12px;font-weight:700;color:var(--ac);margin-bottom:8px}
 .abody{background:var(--sf);border:1px solid var(--bd);border-radius:8px;
   padding:24px;font-size:12px;color:#b0b0bc;line-height:2}
 .footer{margin-top:56px;padding-top:16px;border-top:1px solid var(--bd);
@@ -349,7 +405,7 @@ p{color:#b0b0bc;font-size:13px;line-height:1.8}
   :root{--bg:#fff;--sf:#f7f7f7;--sf2:#efefef;--bd:#ddd;--tx:#111;--mt:#555;
     --ac:#007a62;--pos:#166534;--neg:#991b1b;--tc:${tc}}
   .cover{page-break-after:always}
-  .ac,.card,.box,.score-wrap{break-inside:avoid}
+  .ac,.card,.box,.score-wrap,.bc-box,.comp-card{break-inside:avoid}
 }
 </style>
 </head>
@@ -357,12 +413,12 @@ p{color:#b0b0bc;font-size:13px;line-height:1.8}
 
 <div class="cover">
   <div class="ctop">
-    <div><h1>$${ticker}</h1><div class="mt" style="font-size:14px;margin-top:4px">${ticker}</div></div>
+    <div><h1>$${esc(ticker)}</h1><div class="mt" style="font-size:14px;margin-top:4px">${esc(ticker)}</div></div>
     <div><div class="tbadge">${tierLbl}</div><div class="tdate">Asymmetry Radar · ${ts}</div></div>
   </div>
   <div class="thesis-block">
     <div class="thesis-lbl">Investment Thesis</div>
-    <div class="thesis-tx">${p.thesis}</div>
+    <div class="thesis-tx">${esc(p.thesis)}</div>
   </div>
 </div>
 
@@ -380,7 +436,7 @@ p{color:#b0b0bc;font-size:13px;line-height:1.8}
 <div class="biz-grid">
   <div class="box">
     <h3>How They Make Money</h3>
-    <p>${p.business_model}</p>
+    <p>${esc(p.business_model)}</p>
     <ul class="streams">${streams}</ul>
   </div>
   <div>
@@ -390,7 +446,7 @@ p{color:#b0b0bc;font-size:13px;line-height:1.8}
     </div>
     <div class="box">
       <h3>Competitive Moat</h3>
-      <p>${p.moat}</p>
+      <p>${esc(p.moat)}</p>
     </div>
   </div>
 </div>
@@ -398,10 +454,10 @@ p{color:#b0b0bc;font-size:13px;line-height:1.8}
 <h2>Conviction Scorecard</h2>
 <div class="score-wrap">
   <div>
-    ${sRow("Asymmetry", s.asymmetry)}
-    ${sRow("Conviction", s.conviction)}
-    ${sRow("Catalyst Strength", s.catalyst)}
-    ${sRow("Management Quality", s.management)}
+    ${sRow("Asymmetry", scores.asymmetry)}
+    ${sRow("Conviction", scores.conviction)}
+    ${sRow("Catalyst Strength", scores.catalyst)}
+    ${sRow("Management Quality", scores.management)}
   </div>
   <div class="overall"><div class="onum">${p.overall}</div><div class="odenom">/ 100</div></div>
 </div>
@@ -414,11 +470,15 @@ p{color:#b0b0bc;font-size:13px;line-height:1.8}
 </div>
 <div class="vbox">
   <div class="vlbl">⚠ Invalidation Trigger</div>
-  <p>${p.invalidation}</p>
+  <p>${esc(p.invalidation)}</p>
 </div>
+
+${bullBearHtml}
 
 <h2>Catalysts — Next 12 Months</h2>
 <div>${cats}</div>
+
+${compVsHtml}
 
 <h2>Full Analysis</h2>
 <div class="abody">${analysisHtml}</div>
@@ -428,19 +488,6 @@ p{color:#b0b0bc;font-size:13px;line-height:1.8}
   <span>Not investment advice. Do your own research.</span>
 </div>
 </body></html>`;
-}
-
-// ── Storage upload ────────────────────────────────────────────────────────────
-
-async function uploadReport(ticker: string, html: string): Promise<string | null> {
-  try {
-    const fname = `${ticker}_${Date.now()}.html`;
-    const { error } = await supabase.storage.from("reports")
-      .upload(fname, new TextEncoder().encode(html), { contentType: "text/html", upsert: true });
-    if (error) return null;
-    const { data: { publicUrl } } = supabase.storage.from("reports").getPublicUrl(fname);
-    return publicUrl;
-  } catch { return null; }
 }
 
 // ── Notification ──────────────────────────────────────────────────────────────
@@ -498,7 +545,7 @@ Deno.serve(async (req: Request) => {
   if (diagMode) {
     const ticker = body.ticker ?? "CODA";
     const res: Record<string, any> = { gemini_key_set: !!GEMINI_KEY, yf_auth_ok: !!auth };
-    try { const s = await getSnapshot(ticker, auth); res.snapshot = s; res.yf_ok = true; }
+    try { const sn = await getSnapshot(ticker, auth); res.snapshot = sn; res.yf_ok = true; }
     catch (e) { res.yf_error = String(e); }
     if (GEMINI_KEY) {
       try {
@@ -542,14 +589,22 @@ Deno.serve(async (req: Request) => {
       if (!shouldNotify) continue;
       oppsFound++;
 
-      const html      = generateHtml(ticker, parsed, snap, qScore);
-      const reportUrl = await uploadReport(ticker, html);
+      const html = generateHtml(ticker, parsed, snap, qScore);
 
-      await supabase.from("radar_opportunities").insert({
+      const { data: oppRow } = await supabase.from("radar_opportunities").insert({
         ticker, tier: parsed.tier, overall_score: parsed.overall,
         quant_score: qScore, thesis: parsed.thesis,
-        gemini_analysis: geminiText, data_snapshot: snap, notified: true,
-      });
+        gemini_analysis: geminiText, data_snapshot: snap,
+        report_html: html, notified: true,
+      }).select("id").single();
+
+      const rowId = oppRow?.id;
+      const reportUrl = rowId ? `${REPORT_BASE}?id=${rowId}` : null;
+
+      if (rowId && reportUrl) {
+        await supabase.from("radar_opportunities")
+          .update({ report_url: reportUrl }).eq("id", rowId);
+      }
 
       const alertMsg = formatAlert(ticker, parsed, snap)
         + (reportUrl ? `\n\n📄 Full Report:\n${reportUrl}` : "");
