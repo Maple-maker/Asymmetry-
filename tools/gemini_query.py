@@ -26,7 +26,7 @@ def analyze(ticker: str, query: str, document_paths: list[str] = None) -> str:
         return "ERROR: GEMINI_API_KEY environment variable not set"
 
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-1.5-pro")
+    model = genai.GenerativeModel("gemini-2.5-pro")
 
     system_prompt = f"""You are a specialized quantitative research agent for the Asymmetry Opportunity Radar.
 Analyzing: {ticker}
@@ -74,7 +74,7 @@ def quick_query(prompt: str) -> str:
         return "ERROR: GEMINI_API_KEY environment variable not set"
 
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    model = genai.GenerativeModel("gemini-2.5-flash")
     response = model.generate_content(prompt)
     return response.text
 
