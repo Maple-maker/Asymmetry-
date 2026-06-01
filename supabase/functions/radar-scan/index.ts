@@ -1,5 +1,5 @@
 // Deployed via Supabase MCP — see deploy history in AEGIS project
-// Function: radar-scan | Project: jmtkygwvmrolfvwueggs | Version: 19
+// Function: radar-scan | Project: jmtkygwvmrolfvwueggs | Version: 21
 // Schedule: 3x daily via pg_cron (0 7,13,19 * * *) — 7am, 1pm, 7pm UTC
 // Data: Yahoo Finance (crumb auth) — all tickers, no API key required
 // Reports: HTML stored in radar_opportunities.report_html → served by report-viewer edge fn
@@ -667,9 +667,9 @@ async function updateMemory(ticker: string, p: ReturnType<typeof parseGemini>, s
 
 // ── GitHub vault push ─────────────────────────────────────────────────────────
 
-async function pushToGitHub(path: string, content: string, message: string): Promise<void> {
+async function pushToGitHub(path: string, content: string, message: string): Promise<{ ok: boolean; status: number; body: string }> {
   const token  = Deno.env.get("GITHUB_TOKEN");
-  if (!token) return;
+  if (!token) return { ok: false, status: 0, body: "GITHUB_TOKEN not set" };
   const repo   = Deno.env.get("GITHUB_REPO")   ?? "maple-maker/aegis-intel-vault";
   const branch = Deno.env.get("GITHUB_BRANCH") ?? "main";
   const apiUrl = `https://api.github.com/repos/${repo}/contents/${path}`;
@@ -686,13 +686,16 @@ async function pushToGitHub(path: string, content: string, message: string): Pro
     if (r.ok) sha = (await r.json()).sha;
   } catch { /* new file */ }
 
-  const body: Record<string, any> = {
+  const payload: Record<string, any> = {
     message, branch,
     content: btoa(unescape(encodeURIComponent(content))),
   };
-  if (sha) body.sha = sha;
+  if (sha) payload.sha = sha;
 
-  await fetch(apiUrl, { method: "PUT", headers: hdrs, body: JSON.stringify(body) });
+  const res  = await fetch(apiUrl, { method: "PUT", headers: hdrs, body: JSON.stringify(payload) });
+  const text = await res.text();
+  if (!res.ok) console.error(`[github] PUT ${path} → ${res.status}: ${text.slice(0, 300)}`);
+  return { ok: res.ok, status: res.status, body: text.slice(0, 300) };
 }
 
 // ── Notification ──────────────────────────────────────────────────────────────
@@ -747,6 +750,19 @@ Deno.serve(async (req: Request) => {
 
   const auth   = await getYFAuth();
   const memory = await readMemory();
+
+  if (body.github_test === true) {
+    const token  = Deno.env.get("GITHUB_TOKEN");
+    const repo   = Deno.env.get("GITHUB_REPO")   ?? "maple-maker/aegis-intel-vault";
+    const branch = Deno.env.get("GITHUB_BRANCH") ?? "main";
+    const result = await pushToGitHub(
+      "vault/_test/radar-ping.md",
+      `# Radar Ping\nTest push from asymmetry-radar at ${new Date().toISOString()}\n`,
+      `test: radar → vault ping [${new Date().toISOString().slice(0, 10)}]`
+    );
+    return new Response(JSON.stringify({ token_set: !!token, repo, branch, ...result }, null, 2),
+      { headers: { "Content-Type": "application/json" } });
+  }
 
   if (diagMode) {
     const ticker = body.ticker ?? "CODA";
