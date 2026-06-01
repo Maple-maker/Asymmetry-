@@ -204,14 +204,13 @@ When a Tier 1 or high-conviction Tier 2 opportunity is identified, send a Telegr
 
 ### Alert delivery
 
-Use `notify.sh` (at repo root) or call the Supabase relay directly with `curl`:
+Use the Supabase MCP tool `execute_sql` on project `lmgphebvungyqsnqitcg` to call the `notify_ntfy` function. This routes through PostgreSQL → pg_net → ntfy.sh → your phone. No curl or outbound HTTP needed from the session.
 
-```bash
-curl -s -X POST "https://lmgphebvungyqsnqitcg.supabase.co/functions/v1/telegram-notify" \
-  -H "Content-Type: application/json" \
-  -H "x-notify-secret: ${NOTIFY_SECRET}" \
-  -d "{\"messages\": [\"YOUR MESSAGE HERE\"]}"
+```sql
+SELECT notify_ntfy('Alert title here', 'Message body here');
 ```
+
+Priority scale: 5 = max urgency, 4 = high (default), 3 = normal, 2 = low.
 
 ### Message format — Tier 1 / Tier 2 alert (send first)
 

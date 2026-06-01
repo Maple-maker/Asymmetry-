@@ -1,34 +1,20 @@
 #!/usr/bin/env bash
-# Sends one or more messages to Telegram via the Supabase relay.
-# Usage: ./notify.sh "message1" "message2" ...
-# Required env vars: NOTIFY_SECRET
+# Sends a push notification to ntfy topic 'asymmetry-radar' via Supabase pg_net.
+# Usage: ./notify.sh "Title" "Message body"
+# Requires: supabase CLI authenticated, or run via Claude MCP directly.
+#
+# From Claude sessions: use execute_sql MCP tool instead:
+#   SELECT notify_ntfy('Title', 'Message body');
 
 set -euo pipefail
 
-FUNCTION_URL="https://lmgphebvungyqsnqitcg.supabase.co/functions/v1/telegram-notify"
+TITLE="${1:-Asymmetry Radar}"
+BODY="${2:-No message provided}"
+PROJECT_ID="lmgphebvungyqsnqitcg"
 
-if [[ -z "${NOTIFY_SECRET:-}" ]]; then
-  echo "ERROR: NOTIFY_SECRET env var is not set." >&2
-  exit 1
-fi
+# Escape single quotes for SQL
+SAFE_TITLE="${TITLE//\'/\'\'}"
+SAFE_BODY="${BODY//\'/\'\'}"
 
-if [[ $# -eq 0 ]]; then
-  echo "Usage: $0 \"message1\" [\"message2\" ...]" >&2
-  exit 1
-fi
-
-# Build JSON array of messages
-MESSAGES_JSON="["
-for i in "$@"; do
-  # Escape backslashes and double-quotes for JSON
-  escaped=$(printf '%s' "$i" | sed 's/\\/\\\\/g; s/"/\\"/g')
-  MESSAGES_JSON+="\"${escaped}\","
-done
-MESSAGES_JSON="${MESSAGES_JSON%,}]"
-
-PAYLOAD="{\"messages\":${MESSAGES_JSON}}"
-
-curl -s -X POST "$FUNCTION_URL" \
-  -H "Content-Type: application/json" \
-  -H "x-notify-secret: ${NOTIFY_SECRET}" \
-  -d "$PAYLOAD"
+supabase db execute --project-ref "$PROJECT_ID" \
+  "SELECT notify_ntfy('${SAFE_TITLE}', '${SAFE_BODY}');"
