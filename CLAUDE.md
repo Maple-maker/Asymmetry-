@@ -141,6 +141,28 @@ Search Yahoo Finance and Macrotrends to build a relative valuation table compari
 
 **Interpretation:** Flag which company offers the lowest valuation relative to its growth rate. Note any outliers — a company trading at a discount to peers despite superior growth is worth investigating further. A company trading at a premium must justify it with superior margins, moat, or catalyst pipeline.
 
+#### 6. Bear Case — 3 Reasons NOT to Own This
+
+Act as a skeptical short-seller. Search SEC filings, earnings transcripts, and recent news. Identify the 3 most serious red flags, ranked by severity. Cite a specific source for each.
+
+Check specifically for:
+
+- **Customer concentration** — does any single customer represent >25% of revenue? (Source: latest 10-K)
+- **Margin compression** — are gross margins AND operating margins compressing over the last 4 quarters? (Source: quarterly earnings)
+- **Unscheduled insider selling** — Form 4 filings showing open-market sales NOT under a pre-planned 10b5-1 plan
+- **Widening GAAP vs. non-GAAP gap** — is the company hiding deteriorating fundamentals behind adjusted metrics?
+- **Guidance cuts** — has management lowered forward guidance in the last 12 months?
+
+Format:
+
+**Red Flag #1 (Severity: High/Medium/Low):** [Description] — Source: [Filing/Transcript/Date]
+
+**Red Flag #2 (Severity: High/Medium/Low):** [Description] — Source: [Filing/Transcript/Date]
+
+**Red Flag #3 (Severity: High/Medium/Low):** [Description] — Source: [Filing/Transcript/Date]
+
+**Bear Case Verdict:** Given these risks, does the bull thesis still hold? What would need to be true to dismiss each red flag?
+
 ---
 
 ## Reference Archetypes
