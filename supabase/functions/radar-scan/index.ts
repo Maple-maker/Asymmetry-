@@ -1,5 +1,5 @@
 // Deployed via Supabase MCP — see deploy history in AEGIS project
-// Function: radar-scan | Project: jmtkygwvmrolfvwueggs | Version: 21
+// Function: radar-scan | Project: jmtkygwvmrolfvwueggs | Version: 24
 // Schedule: 3x daily via pg_cron (0 7,13,19 * * *) — 7am, 1pm, 7pm UTC
 // Data: Yahoo Finance (crumb auth) — all tickers, no API key required
 // Reports: HTML stored in radar_opportunities.report_html → served by report-viewer edge fn
@@ -12,6 +12,8 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "jsr:@supabase/supabase-js@2";
 
 const GEMINI_KEY   = Deno.env.get("GEMINI_API_KEY");
+const VENICE_KEY   = Deno.env.get("VENICE_API_KEY");
+const DEEPSEEK_KEY = Deno.env.get("DEEPSEEK_API_KEY");
 const NTFY_TOPIC   = "asymmetry-radar";
 const GEMINI_MODEL = "gemini-2.5-flash";
 const GEMINI_BASE  = "https://generativelanguage.googleapis.com/v1beta";
@@ -134,14 +136,139 @@ function quantScore(s: Record<string, any>): number {
   return Math.max(0, Math.min(100, sc));
 }
 
-// ── Gemini analysis ───────────────────────────────────────────────────────────
+// ── Venice AI (bull advocate, web-search enabled) ─────────────────────────────
 
-async function geminiAnalyze(ticker: string, snap: Record<string, any>, memory = ""): Promise<string> {
+async function callVenice(prompt: string): Promise<string> {
+  if (!VENICE_KEY) return "";
+  try {
+    const res = await fetch("https://api.venice.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${VENICE_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "kimi-k2-5",
+        messages: [{ role: "user", content: prompt }],
+        venice_parameters: { enable_web_search: "auto" },
+        max_tokens: 1200,
+      }),
+      signal: AbortSignal.timeout(30000),
+    });
+    if (!res.ok) { console.error(`[venice] ${res.status}: ${(await res.text()).slice(0, 200)}`); return ""; }
+    const data = await res.json();
+    return data.choices?.[0]?.message?.content ?? "";
+  } catch (e) { console.error(`[venice] ${String(e)}`); return ""; }
+}
+
+// ── DeepSeek (bear advocate, quantitative) ────────────────────────────────────
+
+async function callDeepSeek(prompt: string): Promise<string> {
+  if (!DEEPSEEK_KEY) return "";
+  try {
+    const res = await fetch("https://api.deepseek.com/v1/chat/completions", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${DEEPSEEK_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "deepseek-chat",
+        messages: [{ role: "user", content: prompt }],
+        max_tokens: 1200,
+      }),
+      signal: AbortSignal.timeout(30000),
+    });
+    if (!res.ok) { console.error(`[deepseek] ${res.status}: ${(await res.text()).slice(0, 200)}`); return ""; }
+    const data = await res.json();
+    return data.choices?.[0]?.message?.content ?? "";
+  } catch (e) { console.error(`[deepseek] ${String(e)}`); return ""; }
+}
+
+// ── Multi-model debate: Venice (bull) ↔ DeepSeek (bear), 2 rounds ─────────────
+
+async function runDebate(ticker: string, snap: Record<string, any>): Promise<string> {
+  if (!VENICE_KEY && !DEEPSEEK_KEY) return "";
+
+  const price = snap.price != null ? `$${snap.price}` : "N/A";
+  const mcap  = snap.market_cap ? `$${(snap.market_cap / 1e6).toFixed(0)}M` : "N/A";
+  const rev   = snap.revenue_growth != null ? `${(snap.revenue_growth * 100).toFixed(1)}%` : "N/A";
+  const gm    = snap.gross_margin  != null ? `${(snap.gross_margin  * 100).toFixed(1)}%` : "N/A";
+  const ps    = snap.ps_ttm  != null ? `${snap.ps_ttm.toFixed(1)}x`  : "N/A";
+  const ev    = snap.ev_ebitda != null ? `${snap.ev_ebitda.toFixed(1)}x` : "N/A";
+  const ins   = `${snap.insider_signal} (${snap.insider_buys}B/${snap.insider_sells}S)`;
+  const db    = `Ticker: $${ticker} | Price: ${price} | Market Cap: ${mcap} | Rev Growth YoY: ${rev} | Gross Margin: ${gm} | P/S TTM: ${ps} | EV/EBITDA: ${ev} | Insider: ${ins}`;
+
+  const bullPrompt =
+`You are a BULL ADVOCATE for $${ticker} on the Asymmetry Opportunity Radar.
+${db}
+
+Mission: Make the strongest possible BULL case in 200-300 words.
+1. Search for recent news, contract wins, regulatory approvals, partnerships (last 90 days)
+2. Identify the specific catalyst that could drive 3x+ upside in 12-18 months
+3. Explain what the market is missing or undervaluing
+4. Point to insider buying, institutional accumulation, or analyst upgrades
+
+Be specific — cite recent evidence. No vague assertions.
+End with: BULL TARGET: $XX | TIMEFRAME: XX months | CONVICTION: HIGH/MEDIUM/LOW`;
+
+  const bearPrompt =
+`You are a QUANTITATIVE BEAR ANALYST stress-testing $${ticker}.
+${db}
+
+Mission: Find every reason this stock is overvalued or at risk in 200-300 words.
+1. Is the valuation multiple justified vs peer group? Show the math.
+2. Is revenue growth durable or a one-time event?
+3. Are margins expanding or compressing?
+4. Name the single most dangerous competitive threat in 24 months
+5. Flag any balance sheet, customer concentration, or execution risks
+
+Be specific with numbers. Every claim needs data behind it.
+End with: BEAR TARGET: $XX | PRIMARY RISK: [one sentence] | VERDICT: AVOID/CAUTION/NEUTRAL`;
+
+  // Round 1: parallel — bull and bear make independent cases
+  const [vBull, dsBear] = await Promise.all([callVenice(bullPrompt), callDeepSeek(bearPrompt)]);
+
+  // Round 2: parallel rebuttals — only if both R1 calls returned content
+  let vRebuttal = "", dsRebuttal = "";
+  if (vBull && dsBear) {
+    const rebullPrompt =
+`$${ticker} — the bear analyst raised these concerns:
+
+${dsBear}
+
+You are the BULL advocate. Rebut each bear point in 150-200 words.
+Search for recent evidence that directly contradicts the bear thesis.
+What does the bear miss? Which catalysts does the bear ignore or underweight?`;
+
+    const rebearPrompt =
+`$${ticker} — the bull analyst made this case:
+
+${vBull}
+
+You are the BEAR analyst. Stress-test each bull assumption in 150-200 words.
+What is the probability each catalyst actually materializes?
+Where are the numbers misleading? What does competition look like in 18 months?
+Which single bull assumption, if wrong, breaks the entire thesis?`;
+
+    [vRebuttal, dsRebuttal] = await Promise.all([callVenice(rebullPrompt), callDeepSeek(rebearPrompt)]);
+  }
+
+  const parts: string[] = [];
+  const sep = "\n\n─────────────────────────────\n\n";
+  if (vBull)      parts.push(`BULL CASE — Venice (Kimi K2, web-search enabled):\n${vBull}`);
+  if (vRebuttal)  parts.push(`BULL REBUTTAL — Venice responding to DeepSeek bear case:\n${vRebuttal}`);
+  if (dsBear)     parts.push(`BEAR CASE — DeepSeek (quantitative skeptic):\n${dsBear}`);
+  if (dsRebuttal) parts.push(`BEAR REBUTTAL — DeepSeek responding to Venice bull case:\n${dsRebuttal}`);
+
+  return parts.length > 0 ? parts.join(sep) : "";
+}
+
+// ── Gemini synthesis ──────────────────────────────────────────────────────────
+
+async function geminiAnalyze(ticker: string, snap: Record<string, any>, memory = "", debateContext = ""): Promise<string> {
   if (!GEMINI_KEY) return "GEMINI_API_KEY not set.";
   const memorySection = memory
     ? `\n\n## Agent Memory — Context From Prior Scans\nUse this to identify connections to existing themes and avoid re-surfacing ideas already well-covered:\n${memory}\n`
     : "";
-  const prompt = `You are a quantitative research analyst for the Asymmetry Opportunity Radar.${memorySection}
+  const debateSection = debateContext
+    ? `\n\n## Multi-AI Debate — Bull vs Bear Arguments\nVenice (bull advocate, live web search) and DeepSeek (quantitative bear) have debated this stock in two rounds. Use their arguments to sharpen your analysis — weigh which side has stronger evidence and explicitly state where each is right or wrong in your ANALYSIS section.\n\n${debateContext}\n`
+    : "";
+  const prompt = `You are a quantitative research analyst for the Asymmetry Opportunity Radar.${memorySection}${debateSection}
 Mission: find asymmetric upside in LESSER-KNOWN or BEATEN-DOWN stocks that institutional capital has ignored.
 Analyze ${ticker} using this live market data:
 ${JSON.stringify(snap, null, 2)}
@@ -779,7 +906,7 @@ Deno.serve(async (req: Request) => {
 
   if (diagMode) {
     const ticker = body.ticker ?? "CODA";
-    const res: Record<string, any> = { gemini_key_set: !!GEMINI_KEY, yf_auth_ok: !!auth };
+    const res: Record<string, any> = { gemini_key_set: !!GEMINI_KEY, venice_key_set: !!VENICE_KEY, deepseek_key_set: !!DEEPSEEK_KEY, yf_auth_ok: !!auth };
     try { const sn = await getSnapshot(ticker, auth); res.snapshot = sn; res.yf_ok = true; }
     catch (e) { res.yf_error = String(e); }
     if (GEMINI_KEY) {
@@ -813,13 +940,21 @@ Deno.serve(async (req: Request) => {
       const qScore = quantScore(snap);
       if (!testMode && qScore < 55) continue;
 
-      const geminiText = await geminiAnalyze(ticker, snap, memory);
-      const parsed     = parseGemini(geminiText);
+      // Phase 1: quick Gemini scan to filter before spending debate tokens
+      const phase1Text = await geminiAnalyze(ticker, snap, memory);
+      const phase1     = parseGemini(phase1Text);
+      if (phase1.overall < 75 || phase1.tier > 2) continue;
 
-      // Quality gate: 75+ overall score, Tier 1 or 2 only — always enforced
-      const shouldNotify = parsed.overall >= 75 && parsed.tier <= 2;
+      // Phase 2: multi-model debate for qualifying tickers only
+      // Venice (bull) and DeepSeek (bear) debate in 2 rounds; Gemini synthesizes.
+      const debateCtx  = await runDebate(ticker, snap);
+      const geminiText = debateCtx
+        ? await geminiAnalyze(ticker, snap, memory, debateCtx)
+        : phase1Text;
+      const parsed = debateCtx ? parseGemini(geminiText) : phase1;
 
-      if (!shouldNotify) continue;
+      // Quality gate re-check — debate may sharpen scores up or down
+      if (parsed.overall < 75 || parsed.tier > 2) continue;
       oppsFound++;
 
       const html     = generateHtml(ticker, parsed, snap, qScore);
@@ -843,7 +978,7 @@ Deno.serve(async (req: Request) => {
       const { data: oppRow } = await supabase.from("radar_opportunities").insert({
         ticker, tier: parsed.tier, overall_score: parsed.overall,
         quant_score: qScore, thesis: parsed.thesis,
-        gemini_analysis: geminiText, data_snapshot: snap,
+        gemini_analysis: geminiText, data_snapshot: { ...snap, debate_transcript: debateCtx || null },
         report_html: html, report_md: mdReport, notified: true,
       }).select("id").single();
 
