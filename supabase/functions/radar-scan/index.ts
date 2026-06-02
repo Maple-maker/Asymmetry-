@@ -1,5 +1,5 @@
 // Deployed via Supabase MCP — see deploy history in AEGIS project
-// Function: radar-scan | Project: jmtkygwvmrolfvwueggs | Version: 24
+// Function: radar-scan | Project: jmtkygwvmrolfvwueggs | Version: 27
 // Schedule: 3x daily via pg_cron (0 7,13,19 * * *) — 7am, 1pm, 7pm UTC
 // Data: Yahoo Finance (crumb auth) — all tickers, no API key required
 // Reports: HTML stored in radar_opportunities.report_html → served by report-viewer edge fn
@@ -941,9 +941,10 @@ Deno.serve(async (req: Request) => {
       if (!testMode && qScore < 55) continue;
 
       // Phase 1: quick Gemini scan to filter before spending debate tokens
+      // testMode bypasses the gate so the full pipeline can be exercised manually
       const phase1Text = await geminiAnalyze(ticker, snap, memory);
       const phase1     = parseGemini(phase1Text);
-      if (phase1.overall < 75 || phase1.tier > 2) continue;
+      if (!testMode && (phase1.overall < 75 || phase1.tier > 2)) continue;
 
       // Phase 2: multi-model debate for qualifying tickers only
       // Venice (bull) and DeepSeek (bear) debate in 2 rounds; Gemini synthesizes.
@@ -954,7 +955,8 @@ Deno.serve(async (req: Request) => {
       const parsed = debateCtx ? parseGemini(geminiText) : phase1;
 
       // Quality gate re-check — debate may sharpen scores up or down
-      if (parsed.overall < 75 || parsed.tier > 2) continue;
+      // testMode also bypasses here so the full result is always saved for inspection
+      if (!testMode && (parsed.overall < 75 || parsed.tier > 2)) continue;
       oppsFound++;
 
       const html     = generateHtml(ticker, parsed, snap, qScore);
