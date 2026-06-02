@@ -91,6 +91,44 @@ async function getSP500(): Promise<{ value: number; change_pct: number } | null>
   } catch { return null; }
 }
 
+// ── Sector dislocation scan ───────────────────────────────────────────────────
+
+const SECTORS = [
+  { etf: "XLK",  name: "Technology" },
+  { etf: "XLF",  name: "Financials" },
+  { etf: "XLV",  name: "Health Care" },
+  { etf: "XLE",  name: "Energy" },
+  { etf: "XLC",  name: "Comm Svcs" },
+  { etf: "XLY",  name: "Cons Discret" },
+  { etf: "XLP",  name: "Cons Staples" },
+  { etf: "XLI",  name: "Industrials" },
+  { etf: "XLB",  name: "Materials" },
+  { etf: "XLRE", name: "Real Estate" },
+  { etf: "XLU",  name: "Utilities" },
+];
+
+interface SectorData { etf: string; name: string; price: number; year_high: number; pct_from_high: number }
+
+async function getSectorData(): Promise<SectorData[]> {
+  const out: SectorData[] = [];
+  for (const s of SECTORS) {
+    try {
+      const res = await fetch(
+        `https://query1.finance.yahoo.com/v8/finance/chart/${s.etf}?range=1y&interval=1d`,
+        { headers: { "User-Agent": YF_UA, "Accept": "application/json" } }
+      );
+      if (!res.ok) continue;
+      const j    = await res.json();
+      const meta = j?.chart?.result?.[0]?.meta ?? {};
+      const price  = meta.regularMarketPrice ?? 0;
+      const yHigh  = meta.fiftyTwoWeekHigh   ?? 0;
+      if (!price || !yHigh) continue;
+      out.push({ ...s, price, year_high: yHigh, pct_from_high: +((price - yHigh) / yHigh * 100).toFixed(1) });
+    } catch { /* skip */ }
+  }
+  return out;
+}
+
 // ── DCA signal logic ──────────────────────────────────────────────────────────
 
 interface DCASignal {
@@ -173,7 +211,7 @@ function bar10(v: number, max: number): string {
   return "█".repeat(Math.min(filled, 10)) + "░".repeat(Math.max(0, 10 - filled));
 }
 
-function formatAlert(vix: number, fg: FGData | null, sp: { value: number; change_pct: number } | null, signal: DCASignal): string {
+function formatAlert(vix: number, fg: FGData | null, sp: { value: number; change_pct: number } | null, signal: DCASignal, sectors: SectorData[]): string {
   const fgScore   = fg?.score ?? 0;
   const fgRating  = fg?.rating ?? "N/A";
   const spVal     = sp ? `$${sp.value.toFixed(0)}` : "N/A";
@@ -222,12 +260,21 @@ function formatAlert(vix: number, fg: FGData | null, sp: { value: number; change
     `📌 SIGNAL: ${signal.reason}`,
   );
 
+  const dislocated = sectors.filter(s => s.pct_from_high <= -15).sort((a, b) => a.pct_from_high - b.pct_from_high);
+  if (dislocated.length > 0) {
+    lines.push("", "🔍 SECTOR DISLOCATION (≥15% below 52W high — consider buying)");
+    for (const s of dislocated) {
+      const icon = s.pct_from_high <= -20 ? "🔴" : "⚠️";
+      lines.push(`  ${icon} ${(s.etf + " " + s.name).padEnd(20)} ${s.pct_from_high.toFixed(1)}%`);
+    }
+  }
+
   return lines.join("\n");
 }
 
 function generateMarkdown(
   vix: number, fg: FGData | null, sp: { value: number; change_pct: number } | null,
-  signal: DCASignal, date: string
+  signal: DCASignal, date: string, sectors: SectorData[]
 ): string {
   const fgScore  = fg?.score ?? 0;
   const fgRating = fg?.rating ?? "N/A";
@@ -275,6 +322,12 @@ ${signal.reason}
 | Fear & Greed ≤ ${FG_EXTREME_FEAR} | Confirms extreme fear — supports extra deployment |
 | Annual dry powder target | $${ANNUAL_RESERVE.toLocaleString()} ($${MONTHLY_RESERVE}/month to HYSA) |
 
+## Sector Dislocation
+
+| ETF | Sector | Price | 52W High | % From High | Status |
+|---|---|---|---|---|---|
+${sectors.map(s => `| ${s.etf} | ${s.name} | $${s.price.toFixed(2)} | $${s.year_high.toFixed(2)} | ${s.pct_from_high.toFixed(1)}% | ${s.pct_from_high <= -20 ? "🔴 Deep dislocation" : s.pct_from_high <= -15 ? "⚠️ Dislocated" : "✅ Normal"} |`).join("\n")}
+
 ---
 *Asymmetry Market Pulse · ${date} · Not investment advice.*
 `;
@@ -287,32 +340,36 @@ Deno.serve(async (req: Request) => {
   const testMode = body.test === true;
   const date     = new Date().toISOString().slice(0, 10);
 
-  const [vixData, fgData, spData] = await Promise.all([getVix(), getFearGreed(), getSP500()]);
+  const [vixData, fgData, spData, sectorData] = await Promise.all([getVix(), getFearGreed(), getSP500(), getSectorData()]);
 
-  const vix    = vixData?.value ?? 0;
-  const signal = getDCASignal(vix, fgData?.score ?? 50);
+  const vix        = vixData?.value ?? 0;
+  const signal     = getDCASignal(vix, fgData?.score ?? 50);
+  const dislocated = sectorData.filter(s => s.pct_from_high <= -15);
 
   // Always push daily pulse to vault
-  const mdContent = generateMarkdown(vix, fgData, spData, signal, date);
+  const mdContent = generateMarkdown(vix, fgData, spData, signal, date, sectorData);
   await pushToGitHub(
     `vault/market-pulse/${date}.md`, mdContent,
-    `pulse: VIX ${vix.toFixed(1)} | F&G ${fgData?.score ?? "?"} | ${signal.level} [${date}]`
+    `pulse: VIX ${vix.toFixed(1)} | F&G ${fgData?.score ?? "?"} | ${signal.level} | ${dislocated.length} sectors dislocated [${date}]`
   );
 
-  // Alert only on threshold cross (or test mode)
-  const shouldAlert = testMode || signal.level !== "NONE";
+  // Alert on threshold cross, test mode, or 2+ sectors deeply dislocated
+  const shouldAlert = testMode || signal.level !== "NONE" || dislocated.length >= 2;
 
   if (shouldAlert) {
-    const alertText = formatAlert(vix, fgData, spData, signal);
+    const alertText = formatAlert(vix, fgData, spData, signal, sectorData);
     const title = signal.level === "CRASH" ? `🚨 DCA CRASH PROTOCOL — VIX ${vix.toFixed(1)}` :
                   signal.level === "FEAR"  ? `⚠️ DCA FEAR SIGNAL — VIX ${vix.toFixed(1)}`  :
+                  dislocated.length >= 2   ? `🔍 SECTOR DISLOCATION — ${dislocated.length} sectors ≥15% off high` :
                                              `📊 Market Pulse — VIX ${vix.toFixed(1)}`;
-    await notify(title, alertText, signal.level === "CRASH" ? 5 : signal.level === "FEAR" ? 4 : 3);
+    await notify(title, alertText, signal.level === "CRASH" ? 5 : signal.level === "FEAR" ? 4 : dislocated.length >= 2 ? 4 : 3);
   }
 
   return new Response(JSON.stringify({
     ok: true, date, vix, fear_greed: fgData?.score, sp500: spData?.value,
     signal: signal.level, extra_deploy: signal.extra_deploy,
+    sectors_dislocated: dislocated.length,
+    dislocated_sectors: dislocated.map(s => ({ etf: s.etf, pct_from_high: s.pct_from_high })),
     alerted: shouldAlert,
   }, null, 2), { headers: { "Content-Type": "application/json" } });
 });

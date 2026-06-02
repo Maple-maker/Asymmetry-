@@ -19,6 +19,16 @@ const YF_UA        = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.
 const ANON_KEY     = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImptdGt5Z3d2bXJvbGZ2d3VlZ2dzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODAzMzAxODUsImV4cCI6MjA5NTkwNjE4NX0.JUbsLc_KHHdfXWDSAl9Rf00Da-axpSj4Nw4DvXGNBvk";
 const REPORT_BASE  = `https://jmtkygwvmrolfvwueggs.supabase.co/functions/v1/report-viewer?apikey=${ANON_KEY}`;
 
+// ── Position sizing (DCA model: $1,500/mo — $1,200 base + $300 HYSA) ──────────
+const DCA_BASE = 1200;
+
+function positionMultiplier(score: number): number {
+  if (score >= 90) return 3;
+  if (score >= 80) return 2;
+  return 1;
+}
+function positionDollars(score: number): number { return DCA_BASE * positionMultiplier(score); }
+
 const supabase = createClient(
   Deno.env.get("SUPABASE_URL")!,
   Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
@@ -734,7 +744,10 @@ function formatAlert(ticker: string, p: ReturnType<typeof parseGemini>, snap: Re
     `  Management  ${bar(s.management)}  ${s.management}/10`,
     "  " + "─".repeat(25),
     `  OVERALL     ${p.overall}/100`, "",
-    "⚠️ INVALIDATION", p.invalidation,
+    "⚠️ INVALIDATION", p.invalidation, "",
+    "💰 POSITION SIZE",
+    `  Score ${p.overall}/100 → ${positionMultiplier(p.overall)}x = $${positionDollars(p.overall).toLocaleString()}`,
+    `  Deploy: $${DCA_BASE.toLocaleString()} base${positionMultiplier(p.overall) > 1 ? ` + $${(positionDollars(p.overall) - DCA_BASE).toLocaleString()} from dry powder` : " only (cautious entry)"}`,
   ].join("\n");
 }
 
