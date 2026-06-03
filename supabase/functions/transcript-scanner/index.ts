@@ -53,9 +53,9 @@ async function callVenice(prompt: string): Promise<string> {
         model: "kimi-k2-5",
         messages: [{ role: "user", content: prompt }],
         venice_parameters: { enable_web_search: "auto" },
-        max_tokens: 2000,
+        max_tokens: 4000,
       }),
-      signal: AbortSignal.timeout(45000),
+      signal: AbortSignal.timeout(60000),
     });
     if (!res.ok) {
       const errBody = (await res.text()).slice(0, 400);
@@ -321,6 +321,7 @@ QUOTE: "[exact quote or close paraphrase — cite the source: blog post title, i
 SPEAKER: [Name, Title, Source]
 BENEFICIARY_TYPE: [specific type of smaller company that would benefit — be precise, e.g. "liquid cooling data center specialist", "custom ASIC designer", "synthetic training data provider"]
 URGENCY: HIGH|MEDIUM|LOW
+SOURCE_URL: [direct URL to the blog post, interview, paper, or job posting where you found this — be specific]
 ---END---
 
 Extract 4-8 signals. Prioritize HIGH urgency signals where the need is explicit and near-term. Skip vague or generic statements.
@@ -395,11 +396,138 @@ Your tasks:
    - Non-consensus narrative — not crowded?
    - Acceptable downside — not binary on one event?
 
-Output a brief synthesis (300-400 words) covering:
-- TOP PICK: [ticker] — [one sentence thesis]
-- RANKED LIST: all companies by conviction (HIGH/MEDIUM/LOW)
-- CROWDED TRADES: flag any already-discovered plays to avoid
-- RADAR ADD: list tickers that should be added to the watchlist immediately, with the ${company} signal that triggered it`;
+Output your synthesis using EXACTLY this structure:
+
+BLUF: [single sentence — the single most actionable insight: what specific thing does ${company} need + which specific overlooked company captures that opportunity]
+TOP PICK: [ticker] — [one sentence thesis]
+RANKED LIST: [all companies ranked HIGH/MEDIUM/LOW by conviction]
+CROWDED TRADES: [flag any already well-known plays to avoid]
+RADAR ADD: [list tickers to add to the watchlist, with the ${company} signal that triggered it]`;
+}
+
+// ── GitHub vault push ─────────────────────────────────────────────────────────
+
+const GITHUB_TOKEN  = Deno.env.get("GITHUB_TOKEN");
+const GITHUB_REPO   = "maple-maker/asymmetry-";
+const GITHUB_BRANCH = "claude/opportunity-radar-research-s0VHQ";
+
+async function pushToGitHub(path: string, content: string): Promise<string> {
+  if (!GITHUB_TOKEN) { console.warn("[github] GITHUB_TOKEN not set, skipping vault push"); return ""; }
+  try {
+    const apiUrl = `https://api.github.com/repos/${GITHUB_REPO}/contents/${path}`;
+    // Check if file already exists (to get its SHA for update)
+    let sha: string | undefined;
+    const getRes = await fetch(apiUrl, {
+      headers: {
+        "Authorization": `Bearer ${GITHUB_TOKEN}`,
+        "Accept": "application/vnd.github+json",
+      },
+    });
+    if (getRes.ok) {
+      const existing = await getRes.json();
+      sha = existing.sha;
+    }
+    const body: Record<string, unknown> = {
+      message: `signal: add ${path}`,
+      content: btoa(unescape(encodeURIComponent(content))),
+      branch: GITHUB_BRANCH,
+    };
+    if (sha) body.sha = sha;
+    const putRes = await fetch(apiUrl, {
+      method: "PUT",
+      headers: {
+        "Authorization": `Bearer ${GITHUB_TOKEN}`,
+        "Accept": "application/vnd.github+json",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+    if (!putRes.ok) {
+      const err = (await putRes.text()).slice(0, 200);
+      console.error(`[github] push failed: ${putRes.status} ${err}`);
+      return "";
+    }
+    console.log(`[github] pushed ${path}`);
+    return path;
+  } catch (e) {
+    console.error(`[github] error: ${String(e)}`);
+    return "";
+  }
+}
+
+function generateMarkdownReport(
+  ticker: string,
+  company: string,
+  isPublic: boolean,
+  signals: Signal[],
+  beneficiaries: Beneficiary[],
+  synthesis: string,
+  addedToWatchlist: string[],
+): string {
+  const date = new Date().toISOString().split("T")[0];
+  const highConf = beneficiaries.filter(b => b.confidence === "HIGH");
+  const blufMatch = synthesis.match(/^BLUF:\s*(.+)/im);
+  const bluf = blufMatch ? blufMatch[1].trim() : "";
+  const topPickMatch = synthesis.match(/TOP PICK:\s*([A-Z]+)\s*[—-]\s*(.+)/i);
+  const topPickTicker = topPickMatch ? topPickMatch[1] : (highConf[0]?.ticker ?? "");
+  const topPickThesis = topPickMatch ? topPickMatch[2] : (highConf[0]?.why?.slice(0, 150) ?? "");
+  const sourceUrl = signals.find(s => s.source_url)?.source_url ?? "";
+
+  const lines: string[] = [
+    `# Tech Giant Signal: ${company} (${ticker}) — ${date}`,
+    "",
+    `**Source type:** ${isPublic ? "Earnings call / investor day / SEC filings" : "Blog posts / interviews / job postings (private company)"}`,
+    "",
+    "---",
+    "",
+    "## BLUF",
+    bluf || "_No synthesis generated_",
+    "",
+    "---",
+    "",
+    `## Top Pick: $${topPickTicker}`,
+    topPickThesis,
+    "",
+    "---",
+    "",
+    "## Signals Extracted",
+    "",
+  ];
+
+  for (const [i, s] of signals.entries()) {
+    lines.push(`### Signal ${i + 1} — [${s.urgency}] ${s.type}`);
+    lines.push(`**What:** ${s.what}`);
+    lines.push(`**Quote:** _"${s.quote}"_`);
+    lines.push(`**Speaker:** ${s.speaker}`);
+    lines.push(`**Beneficiary type:** ${s.beneficiary_type}`);
+    if (s.source_url) lines.push(`**Source:** ${s.source_url}`);
+    lines.push("");
+  }
+
+  lines.push("---", "", "## Beneficiary Companies", "");
+
+  for (const b of beneficiaries) {
+    lines.push(`### $${b.ticker} — ${b.name} [${b.confidence}]`);
+    lines.push(`**Market cap:** ${b.market_cap}`);
+    lines.push(`**Why:** ${b.why}`);
+    lines.push(`**Revenue exposure:** ${b.exposure}`);
+    lines.push(`**Catalyst:** ${b.catalyst}`);
+    lines.push("");
+  }
+
+  lines.push("---", "", "## Full Synthesis", "", synthesis, "");
+
+  if (addedToWatchlist.length > 0) {
+    lines.push("---", "", "## Added to Radar Watchlist", "");
+    for (const t of addedToWatchlist) lines.push(`- $${t}`);
+    lines.push("");
+  }
+
+  if (sourceUrl) {
+    lines.push("---", "", `## Primary Source`, "", sourceUrl, "");
+  }
+
+  return lines.join("\n");
 }
 
 // ── Main scan logic ───────────────────────────────────────────────────────────
@@ -410,6 +538,7 @@ async function runScan(ticker: string, company: string, isPublic: boolean): Prom
   beneficiaries: Beneficiary[];
   synthesis: string;
   addedToWatchlist: string[];
+  vaultPath: string;
 }> {
   console.log(`[scanner] Starting scan: ${company} (${ticker}) | public=${isPublic}`);
 
@@ -442,12 +571,17 @@ async function runScan(ticker: string, company: string, isPublic: boolean): Prom
   }
 
   // ── Save scan record to DB ────────────────────────────────────────────────
+  // Always save raw_extraction even if empty — include Venice error for debugging
+  const rawExtractionParts = [rawSignals, rawBeneficiaries].filter(Boolean);
+  if (rawExtractionParts.length === 0 && lastVeniceError) {
+    rawExtractionParts.push(`[VENICE ERROR] ${lastVeniceError}`);
+  }
   const { data: scanRow, error: scanErr } = await supabase
     .from("tech_signal_scans")
     .insert({
       company: ticker,
       event_type: isPublic ? "auto" : "private_lab",
-      raw_extraction: [rawSignals, rawBeneficiaries].filter(Boolean).join("\n\n---BENEFICIARIES---\n\n"),
+      raw_extraction: rawExtractionParts.join("\n\n---BENEFICIARIES---\n\n") || null,
       signals_json: signals as unknown as Record<string, unknown>[],
       opportunities_found: beneficiaries.length,
     })
@@ -513,7 +647,16 @@ async function runScan(ticker: string, company: string, isPublic: boolean): Prom
     .update({ last_scanned: new Date().toISOString() })
     .eq("ticker", ticker);
 
-  return { scanId, signals, beneficiaries, synthesis, addedToWatchlist };
+  // ── Push markdown report to GitHub vault ─────────────────────────────────
+  const date = new Date().toISOString().split("T")[0];
+  const vaultPathTarget = `vault/signals/${ticker}_${date}.md`;
+  let vaultPath = "";
+  if (beneficiaries.length > 0) {
+    const md = generateMarkdownReport(ticker, company, isPublic, signals, beneficiaries, synthesis, addedToWatchlist);
+    vaultPath = await pushToGitHub(vaultPathTarget, md);
+  }
+
+  return { scanId, signals, beneficiaries, synthesis, addedToWatchlist, vaultPath };
 }
 
 // ── Format ntfy notification ──────────────────────────────────────────────────
@@ -526,66 +669,75 @@ function formatNotification(
   addedToWatchlist: string[],
   synthesis: string,
   isPublic: boolean,
+  vaultPath: string,
 ): { title: string; message: string } {
-  const highConf  = beneficiaries.filter(b => b.confidence === "HIGH");
-  const medConf   = beneficiaries.filter(b => b.confidence === "MEDIUM");
-  const highSigs  = signals.filter(s => s.urgency === "HIGH");
+  const highConf = beneficiaries.filter(b => b.confidence === "HIGH");
+  const medConf  = beneficiaries.filter(b => b.confidence === "MEDIUM");
 
-  // Extract top pick from synthesis if present
-  const topPickMatch = synthesis.match(/TOP PICK:\s*([A-Z]+)\s*[—-]/);
-  const topPick = topPickMatch ? topPickMatch[1] : (highConf[0]?.ticker ?? "");
+  // Extract BLUF from synthesis
+  const blufMatch = synthesis.match(/^BLUF:\s*(.+)/im);
+  const bluf = blufMatch ? blufMatch[1].trim() : "";
+
+  // Extract top pick
+  const topPickMatch = synthesis.match(/TOP PICK:\s*([A-Z]+)\s*[—-]\s*(.+)/i);
+  const topPickTicker = topPickMatch ? topPickMatch[1] : (highConf[0]?.ticker ?? "");
+  const topPickThesis = topPickMatch ? topPickMatch[2].slice(0, 120) : (highConf[0]?.why?.slice(0, 120) ?? "");
+
+  // Best source URL from signals
+  const sourceUrl = signals.find(s => s.source_url)?.source_url ?? "";
 
   const labTag = isPublic ? "" : " 🔒";
-  const title = `📡 Tech Signal: ${company}${labTag} → ${beneficiaries.length} plays found`;
+  const title = `📡 Tech Signal — ${ticker}${labTag} | ${beneficiaries.length} plays found`;
 
   const lines: string[] = [
-    `📡 TECH GIANT SIGNAL SCAN — ${company} (${ticker})${labTag}`,
-    "━".repeat(32),
+    `📡 TECH SIGNAL — ${ticker} | ${company}${labTag}`,
+    "━".repeat(34),
     "",
-    `🎯 SIGNALS DETECTED: ${signals.length} (${highSigs.length} HIGH urgency)`,
   ];
 
-  if (!isPublic) {
-    lines.push(`ℹ️  Source: public blog posts, interviews, job postings (private company)`);
+  // BLUF — most important section
+  if (bluf) {
+    lines.push("⚡ BLUF");
+    lines.push(bluf);
+    lines.push("");
   }
 
-  if (highSigs.length > 0) {
-    for (const s of highSigs.slice(0, 3)) {
-      lines.push(`  • [${s.type}] ${s.what.slice(0, 80)}`);
-    }
+  // Top pick
+  if (topPickTicker) {
+    lines.push(`🎯 TOP PICK: $${topPickTicker}`);
+    if (topPickThesis) lines.push(`   ${topPickThesis}`);
+    lines.push("");
   }
 
-  lines.push("", `🏢 BENEFICIARY COMPANIES: ${beneficiaries.length} found`);
+  // All picks summary
+  const highList = highConf.map(b => `$${b.ticker}`).join(", ");
+  const medList  = medConf.slice(0, 4).map(b => `$${b.ticker}`).join(", ");
+  lines.push(`📋 ALL PICKS (${beneficiaries.length} companies)`);
+  if (highList) lines.push(`HIGH: ${highList}`);
+  if (medList)  lines.push(`MED:  ${medList}`);
+  lines.push("");
 
-  if (highConf.length > 0) {
-    lines.push(`  HIGH confidence:`);
-    for (const b of highConf) {
-      lines.push(`    ✅ $${b.ticker} — ${b.name.slice(0, 40)}`);
-      lines.push(`       ${b.why.slice(0, 100)}...`);
-    }
-  }
-
-  if (medConf.length > 0) {
-    lines.push(`  MEDIUM confidence:`);
-    for (const b of medConf.slice(0, 3)) {
-      lines.push(`    🔶 $${b.ticker} — ${b.name.slice(0, 40)}`);
-    }
-  }
-
-  if (topPick) {
-    lines.push("", `⭐ TOP PICK: $${topPick}`);
-  }
-
+  // Watchlist
   if (addedToWatchlist.length > 0) {
-    lines.push("", `➕ ADDED TO RADAR WATCHLIST:`);
-    for (const t of addedToWatchlist) {
-      lines.push(`  • $${t}`);
-    }
-  } else {
-    lines.push("", "ℹ️  No HIGH confidence picks met watchlist criteria.");
+    lines.push(`➕ ADDED TO WATCHLIST: ${addedToWatchlist.map(t => `$${t}`).join(", ")}`);
+    lines.push("");
   }
 
-  lines.push("", "→ Full radar scan will run on next cycle.");
+  // Vault report path
+  if (vaultPath) {
+    lines.push(`📁 VAULT REPORT`);
+    lines.push(`   ${vaultPath}`);
+    lines.push("");
+  }
+
+  // Source link
+  if (sourceUrl) {
+    lines.push(`🔗 SOURCE`);
+    lines.push(`   ${sourceUrl}`);
+    lines.push("");
+  }
+
+  lines.push(`→ Next: full radar debate will run on HIGH picks.`);
 
   return { title, message: lines.join("\n") };
 }
@@ -691,12 +843,12 @@ Deno.serve(async (req: Request) => {
     );
   }
 
-  const { scanId, signals, beneficiaries, synthesis, addedToWatchlist } = result;
+  const { scanId, signals, beneficiaries, synthesis, addedToWatchlist, vaultPath } = result;
 
   // ── Send ntfy notification ────────────────────────────────────────────────
   if (beneficiaries.length > 0) {
     const { title, message } = formatNotification(
-      company, ticker, signals, beneficiaries, addedToWatchlist, synthesis, isPublic,
+      company, ticker, signals, beneficiaries, addedToWatchlist, synthesis, isPublic, vaultPath,
     );
     await notify(title, message, 3);
   }
@@ -712,6 +864,7 @@ Deno.serve(async (req: Request) => {
       beneficiaries_found: beneficiaries.length,
       added_to_watchlist: addedToWatchlist,
       synthesis_length: synthesis.length,
+      vault_path: vaultPath || null,
       ...(lastVeniceError ? { venice_error: lastVeniceError } : {}),
     }, null, 2),
     { headers: { "Content-Type": "application/json" } },
