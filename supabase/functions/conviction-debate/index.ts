@@ -841,7 +841,7 @@ Deno.serve(async (req) => {
     await sendSingleAlert(winner.candidate, winner.scores, debate, analysis, vaultPath);
 
     // 9. Persist result to DB
-    await supabase.from("conviction_debates").insert({
+    const { data: debateRow } = await supabase.from("conviction_debates").insert({
       ticker:           winner.candidate.ticker,
       company_name:     winner.candidate.name,
       source_scan_id:   unique[0]?.scan_id ?? null,
@@ -852,7 +852,20 @@ Deno.serve(async (req) => {
       invalidation:     debate.invalidationTrigger,
       vault_path:       vaultPath || null,
       all_candidates:   ranked.map(r => ({ ticker: r.candidate.ticker, score: r.scores.overall })),
-    }).then(({ error: e }) => { if (e) console.warn(`[db] insert warning: ${e.message}`); });
+    }).select("id").single().then(r => { if (r.error) console.warn(`[db] insert warning: ${r.error.message}`); return r; });
+
+    // 10. Publish to app feed (fire-and-forget)
+    if (debateRow?.id) {
+      fetch(`${Deno.env.get("SUPABASE_URL")}/functions/v1/publish-to-feed`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")}`,
+        },
+        body: JSON.stringify({ debate_id: debateRow.id }),
+      }).catch(e => console.warn(`[publish-to-feed] fire-and-forget error: ${e}`));
+      console.log(`[debate] publish-to-feed triggered for debate ${debateRow.id}`);
+    }
 
     return Response.json({
       status: "ok",
