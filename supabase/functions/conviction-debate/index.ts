@@ -498,7 +498,7 @@ function buildProgressBar(score: number, max = 10): string {
   return "█".repeat(filled) + "░".repeat(8 - filled);
 }
 
-async function sendFiveMessages(
+async function sendSingleAlert(
   candidate: Candidate,
   scores: ConvictionScores,
   debate: DebateResult,
@@ -506,164 +506,44 @@ async function sendFiveMessages(
   vaultPath: string,
 ): Promise<void> {
   const t = candidate.ticker;
-  const price = candidate.snap?.price?.toFixed(2) ?? "N/A";
-  const tier = scores.tier === 1 ? "TIER 1 — EXCEPTIONAL" : scores.tier === 2 ? "TIER 2 — HIGH CONVICTION" : "TIER 3 — WATCH";
+  const tierLabel = scores.tier === 1 ? "TIER 1 — EXCEPTIONAL" : scores.tier === 2 ? "TIER 2 — HIGH CONVICTION" : "TIER 3 — WATCH";
   const tierEmoji = scores.tier === 1 ? "🔺" : scores.tier === 2 ? "🟡" : "⚪";
-  const verdictEmoji = debate.verdict === "BULL" ? "🟢 BULL WINS" : debate.verdict === "BEAR" ? "🔴 BEAR WINS" : "🟡 NEUTRAL";
+  const gV = debate.gemini.verdict === "BULL" ? "🟢 BULL" : debate.gemini.verdict === "BEAR" ? "🔴 BEAR" : "🟡 NEUTRAL";
+  const dV = debate.deepseek.verdict === "BULL" ? "🟢 BULL" : debate.deepseek.verdict === "BEAR" ? "🔴 BEAR" : "🟡 NEUTRAL";
+  const cioV = debate.verdict === "BULL" ? "🟢 BULL" : debate.verdict === "BEAR" ? "🔴 BEAR" : "🟡 NEUTRAL";
 
-  // ── Message 1: Alert ──────────────────────────────────────────────────────
-  const msg1 = [
-    `${tierEmoji} ${tier} — $${t}  |  ${candidate.name}`,
+  // Business model: first 2 sentences from LLM or fall back to thesis
+  const bizModel = (() => {
+    const raw = analysis.businessModel || candidate.thesis;
+    const sentences = raw.replace(/\n/g, " ").match(/[^.!?]+[.!?]+/g) ?? [];
+    return sentences.slice(0, 2).join(" ").trim() || raw.slice(0, 200);
+  })();
+
+  const msg = [
+    `${tierEmoji} ${tierLabel} — $${t}  |  ${candidate.name}`,
     "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
     "",
-    "📌 THESIS",
-    candidate.thesis.slice(0, 200),
+    "⚡ BLUF",
+    debate.marketMiss.slice(0, 280),
     "",
-    "💰 ASYMMETRY",
-    `  Entry:    $${price}`,
-    scores.targetPrice ? `  Target:   $${scores.targetPrice}  (+${scores.upsidePct ?? "?"}%)` : "  Target:   See report",
-    scores.floorPrice  ? `  Floor:    $${scores.floorPrice}  (-${scores.downsidePct ?? "?"}%)` : "  Floor:    See report",
-    "  Horizon:  12–18 months",
+    "📡 SOURCE",
+    `${candidate.sourceCompany} → ${candidate.signalTheme || candidate.catalyst.slice(0, 100)}`,
     "",
-    "📊 CONVICTION SCORES",
-    `  Asymmetry      ${buildProgressBar(scores.asymmetry)}  ${scores.asymmetry}/10`,
-    `  Conviction     ${buildProgressBar(scores.conviction)}  ${scores.conviction}/10`,
-    `  Catalyst       ${buildProgressBar(scores.catalyst)}  ${scores.catalyst}/10`,
-    `  Management     ${buildProgressBar(scores.management)}  ${scores.management}/10`,
-    `  ─────────────────────────────`,
-    `  OVERALL        ${scores.overall.toFixed(0)}/100`,
+    "🎯 TAKEAWAY",
+    debate.synthesis.slice(0, 200),
     "",
-    "🤺 DEBATE (Gemini + DeepSeek, both sides)",
-    `  Gemini: ${debate.gemini.verdict} | DeepSeek: ${debate.deepseek.verdict} | CIO: ${verdictEmoji}`,
-    `  ${debate.synthesis.slice(0, 160)}`,
+    "🏢 BUSINESS MODEL",
+    bizModel,
     "",
-    "⚡ CATALYST",
-    `  ${candidate.catalyst.slice(0, 150)}`,
+    `📊 SCORE  ${scores.overall.toFixed(0)}/100  |  ${tierLabel}`,
+    `  Asymmetry ${scores.asymmetry}/10 · Conviction ${scores.conviction}/10 · Catalyst ${scores.catalyst}/10 · Mgmt ${scores.management}/10`,
+    `  Debate: Gemini=${gV} | DeepSeek=${dV} | CIO=${cioV}`,
     "",
-    "🎯 MARKET MISS",
-    `  ${debate.marketMiss.slice(0, 180)}`,
-    "",
-    "→ 4 more messages incoming.",
+    vaultPath ? `📁 FULL REPORT\n  ${vaultPath}` : "📁 FULL REPORT\n  (vault push failed — check logs)",
   ].join("\n");
 
-  // ── Message 2: Business Model & Moat ─────────────────────────────────────
-  const snap = candidate.snap;
-  const fmtNum = (n: number | null, suffix = "", dec = 1) =>
-    n != null ? `${n.toFixed(dec)}${suffix}` : "N/A";
-  const mktCapStr = snap ? (snap.mktCap >= 1e9 ? `$${(snap.mktCap / 1e9).toFixed(1)}B` : `$${(snap.mktCap / 1e6).toFixed(0)}M`) : "N/A";
-
-  const msg2 = [
-    `📊 $${t} — Business Model & Moat`,
-    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-    "",
-    "HOW THEY MAKE MONEY",
-    analysis.businessModel || "(see vault report)",
-    "",
-    "KEY METRICS",
-    `  Price:         $${price}`,
-    `  Market Cap:    ${mktCapStr}`,
-    `  P/E (TTM):     ${fmtNum(snap?.pe ?? null)}`,
-    `  EV/EBITDA:     ${fmtNum(snap?.evToEbitda ?? null)}`,
-    `  P/S (TTM):     ${fmtNum(snap?.psRatioTTM ?? null)}`,
-    `  P/FCF:         ${fmtNum(snap?.pfcfRatioTTM ?? null)}`,
-    `  Gross Margin:  ${snap?.grossMarginTTM ? (snap.grossMarginTTM * 100).toFixed(1) + "%" : "N/A"}`,
-    `  Rev Growth:    ${snap?.revenueGrowthTTM ? (snap.revenueGrowthTTM * 100).toFixed(1) + "%" : "N/A"}`,
-    "",
-    "MOAT",
-    `  Top rivals: ${analysis.competitors.join(" · ") || "see report"}`,
-    analysis.moat || "(see vault report)",
-  ].join("\n");
-
-  // ── Message 3: Catalysts & Asymmetry ─────────────────────────────────────
-  const gVerdict = debate.gemini.verdict === "BULL" ? "🟢 BULL" : debate.gemini.verdict === "BEAR" ? "🔴 BEAR" : "🟡 NEUTRAL";
-  const dVerdict = debate.deepseek.verdict === "BULL" ? "🟢 BULL" : debate.deepseek.verdict === "BEAR" ? "🔴 BEAR" : "🟡 NEUTRAL";
-
-  const msg3 = [
-    `⚡ $${t} — Catalysts + Debate`,
-    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-    "",
-    analysis.catalysts || "(see vault report)",
-    "",
-    "🤺 GEMINI vs DEEPSEEK — BILATERAL DEBATE",
-    "┌─────────────────────────────────────────┐",
-    `│ GEMINI  →  ${gVerdict.padEnd(30)}│`,
-    `│ Bull: ${(debate.gemini.bullCase || "").slice(0, 100).replace(/\n/g, " ")}`,
-    `│ Bear: ${(debate.gemini.bearCase || "").slice(0, 100).replace(/\n/g, " ")}`,
-    `│ Target: ${debate.gemini.priceTarget || "N/A"}  |  Floor: ${debate.gemini.worstCase || "N/A"}`,
-    "├─────────────────────────────────────────┤",
-    `│ DEEPSEEK  →  ${dVerdict.padEnd(28)}│`,
-    `│ Bull: ${(debate.deepseek.bullCase || "").slice(0, 100).replace(/\n/g, " ")}`,
-    `│ Bear: ${(debate.deepseek.bearCase || "").slice(0, 100).replace(/\n/g, " ")}`,
-    `│ Target: ${debate.deepseek.priceTarget || "N/A"}  |  Floor: ${debate.deepseek.worstCase || "N/A"}`,
-    "├─────────────────────────────────────────┤",
-    `│ WHERE THEY AGREE                        │`,
-    `│ ${(debate.agreement || "").slice(0, 100).replace(/\n/g, " ")}`,
-    "├─────────────────────────────────────────┤",
-    `│ GEMINI SEES (unique):                   │`,
-    `│ ${(debate.geminiUnique || "").slice(0, 100).replace(/\n/g, " ")}`,
-    `│ DEEPSEEK SEES (unique):                 │`,
-    `│ ${(debate.deepseekUnique || "").slice(0, 100).replace(/\n/g, " ")}`,
-    "├─────────────────────────────────────────┤",
-    `│ CIO VERDICT: ${verdictEmoji.padEnd(27)}│`,
-    "└─────────────────────────────────────────┘",
-    "",
-    "ASYMMETRY",
-    scores.targetPrice ? `  Bull:  $${scores.targetPrice}  (+${scores.upsidePct ?? "?"}%)` : "  Bull:  See vault report",
-    scores.floorPrice  ? `  Bear:  $${scores.floorPrice}  (-${scores.downsidePct ?? "?"}%)` : "  Bear:  See vault report",
-  ].join("\n");
-
-  // ── Message 4: Peer comparison ────────────────────────────────────────────
-  const msg4 = [
-    `📐 $${t} vs Peers`,
-    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-    "",
-    `Metric          $${t.padEnd(8)} Peer 1     Peer 2`,
-    "──────────────────────────────────────────────",
-    `P/S (TTM)       ${fmtNum(snap?.psRatioTTM ?? null).padEnd(10)}`,
-    `P/FCF           ${fmtNum(snap?.pfcfRatioTTM ?? null).padEnd(10)}`,
-    `EV/EBITDA       ${fmtNum(snap?.evToEbitda ?? null).padEnd(10)}`,
-    `Gross Margin    ${snap?.grossMarginTTM ? (snap.grossMarginTTM * 100).toFixed(1) + "%" : "N/A"}`,
-    `Rev Growth      ${snap?.revenueGrowthTTM ? (snap.revenueGrowthTTM * 100).toFixed(1) + "%" : "N/A"}`,
-    "",
-    analysis.peerTable ? `LLM COMPARISON\n${analysis.peerTable.slice(0, 500)}` : "",
-  ].join("\n");
-
-  // ── Message 5: Bear case ──────────────────────────────────────────────────
-  const bearFlagsRaw = analysis.bearFlags;
-  const getFlag = (n: number) => {
-    const sev = (bearFlagsRaw.match(new RegExp(`RED_FLAG_${n}_SEVERITY:\\s*(.+)`, "i"))?.[1] ?? "MEDIUM").trim();
-    const desc = (bearFlagsRaw.match(new RegExp(`RED_FLAG_${n}:\\s*(.+)`, "i"))?.[1] ?? "").trim();
-    const sevEmoji = sev === "HIGH" ? "🔴" : sev === "LOW" ? "🟢" : "🟡";
-    return `${sevEmoji} RED FLAG #${n} — [${sev}]\n  ${desc.slice(0, 200)}`;
-  };
-  const bearVerdict = (bearFlagsRaw.match(/BEAR_VERDICT:\s*(.+)/i)?.[1] ?? "").trim();
-
-  const msg5 = [
-    `🐻 $${t} — Bear Case`,
-    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-    "",
-    getFlag(1),
-    "",
-    getFlag(2),
-    "",
-    getFlag(3),
-    "",
-    "VERDICT",
-    bearVerdict || debate.synthesis.slice(0, 200),
-    "",
-    "⚠️ INVALIDATION TRIGGER",
-    debate.invalidationTrigger || "(see vault report)",
-    "",
-    vaultPath ? `📁 VAULT\n   ${vaultPath}` : "",
-  ].filter(l => l !== undefined).join("\n");
-
-  // Send all 5 messages sequentially (ntfy ordering)
   const priority = scores.tier === 1 ? 5 : 4;
-  await notify(`${tierEmoji} ${t} — Alert [1/5]`, msg1, priority);
-  await notify(`📊 ${t} — Business Model [2/5]`, msg2, 3);
-  await notify(`⚡ ${t} — Catalysts + Debate [3/5]`, msg3, 3);
-  await notify(`📐 ${t} — Peer Comparison [4/5]`, msg4, 3);
-  await notify(`🐻 ${t} — Bear Case [5/5]`, msg5, 3);
+  await notify(`${tierEmoji} $${t} — ${scores.overall.toFixed(0)}/100 | ${debate.verdict}`, msg, priority);
 }
 
 // ── GitHub vault push ─────────────────────────────────────────────────────────
@@ -956,9 +836,9 @@ Deno.serve(async (req) => {
     const md = generateDebateReport(winner.candidate, winner.scores, debate, analysis);
     const vaultPath = await pushVault(vaultPathTarget, md);
 
-    // 8. Send 5-message ntfy report
-    console.log("[debate] sending ntfy report...");
-    await sendFiveMessages(winner.candidate, winner.scores, debate, analysis, vaultPath);
+    // 8. Send single-message ntfy alert
+    console.log("[debate] sending ntfy alert...");
+    await sendSingleAlert(winner.candidate, winner.scores, debate, analysis, vaultPath);
 
     // 9. Persist result to DB
     await supabase.from("conviction_debates").insert({
