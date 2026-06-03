@@ -259,90 +259,171 @@ Scoring guide:
   return scores;
 }
 
-// ── Gemini vs DeepSeek debate ─────────────────────────────────────────────────
+// ── Gemini vs DeepSeek debate (holistic — each argues BOTH sides) ─────────────
+// Both models independently assess the full bull AND bear case, state their own
+// verdict, then a synthesis surfaces where they agree, where they diverge, and
+// why the divergence points are the most actionable information.
 
-interface DebateResult {
+interface ModelAnalysis {
   bullCase: string;
   bearCase: string;
+  verdict: "BULL" | "BEAR" | "NEUTRAL";
+  priceTarget: string;
+  worstCase: string;
+  marketMiss: string;
+  invalidationTrigger: string;
+}
+
+interface DebateResult {
+  gemini: ModelAnalysis;
+  deepseek: ModelAnalysis;
+  agreement: string;
+  geminiUnique: string;
+  deepseekUnique: string;
   synthesis: string;
   verdict: "BULL" | "BEAR" | "NEUTRAL";
   marketMiss: string;
   invalidationTrigger: string;
 }
 
+function buildAnalysisPrompt(ticker: string, name: string, context: string, modelName: string): string {
+  return `You are ${modelName}, a senior portfolio manager conducting a holistic investment analysis of ${name} (${ticker}).
+
+${context}
+
+Your job: evaluate this opportunity with fresh eyes. Argue BOTH sides honestly and reach your own verdict.
+
+BULL_CASE:
+[3 paragraphs — the strongest case FOR owning this: supply chain logic, revenue drivers, market position, why the thesis is credible]
+
+BEAR_CASE:
+[3 paragraphs — the strongest case AGAINST: execution risk, competition, valuation concern, what could go wrong]
+
+MARKET_MISS: [one sentence — the single most important thing the market is mispricing, bullish OR bearish]
+PRICE_TARGET: [$XX — your 18-month bull case target with the key assumption]
+WORST_CASE: [$XX — your 18-month bear case floor if the thesis fails]
+INVALIDATION_TRIGGER: [the specific, measurable condition that would make you exit — e.g. "HBM order cancellations exceed 20% of backlog OR gross margin falls below 45% for 2 consecutive quarters"]
+VERDICT: BULL|BEAR|NEUTRAL [your honest conclusion]
+CONVICTION: [1-10]`;
+}
+
+function parseModelAnalysis(raw: string): ModelAnalysis {
+  const get = (key: string) => {
+    const m = raw.match(new RegExp(`^${key}:\\s*(.+)`, "im"));
+    return m ? m[1].trim() : "";
+  };
+  const getBlock = (startKey: string, endKey: string) => {
+    const m = raw.match(new RegExp(`^${startKey}:\\s*\\n([\\s\\S]*?)(?=^${endKey}:|$)`, "im"));
+    return m ? m[1].trim() : get(startKey);
+  };
+
+  const verdictStr = get("VERDICT").toUpperCase();
+  const verdict: "BULL" | "BEAR" | "NEUTRAL" =
+    verdictStr === "BULL" ? "BULL" : verdictStr === "BEAR" ? "BEAR" : "NEUTRAL";
+
+  // Extract multi-line bull/bear blocks
+  const bullMatch = raw.match(/^BULL_CASE:\s*\n([\s\S]*?)(?=^BEAR_CASE:|^MARKET_MISS:|^PRICE_TARGET:|^WORST_CASE:|$)/im);
+  const bearMatch = raw.match(/^BEAR_CASE:\s*\n([\s\S]*?)(?=^BULL_CASE:|^MARKET_MISS:|^PRICE_TARGET:|^WORST_CASE:|$)/im);
+
+  return {
+    bullCase:            bullMatch?.[1]?.trim() || getBlock("BULL_CASE", "BEAR_CASE"),
+    bearCase:            bearMatch?.[1]?.trim() || getBlock("BEAR_CASE", "MARKET_MISS"),
+    verdict,
+    priceTarget:         get("PRICE_TARGET"),
+    worstCase:           get("WORST_CASE"),
+    marketMiss:          get("MARKET_MISS"),
+    invalidationTrigger: get("INVALIDATION_TRIGGER"),
+  };
+}
+
 async function runDebate(candidate: Candidate, scores: ConvictionScores): Promise<DebateResult> {
-  const context = `
-Company: ${candidate.name} (${candidate.ticker})
+  const mktCapStr = candidate.snap
+    ? (candidate.snap.mktCap >= 1e9 ? `$${(candidate.snap.mktCap / 1e9).toFixed(1)}B` : `$${(candidate.snap.mktCap / 1e6).toFixed(0)}M`)
+    : "N/A";
+
+  const context = `Company: ${candidate.name} (${candidate.ticker})
 Source signal: ${candidate.sourceCompany} — ${candidate.signalTheme}
 Thesis: ${candidate.thesis}
 Catalyst: ${candidate.catalyst}
-Price: $${candidate.snap?.price?.toFixed(2) ?? "N/A"} | Market cap: $${candidate.snap ? (candidate.snap.mktCap / 1e6).toFixed(0) + "M" : "N/A"}
+Price: $${candidate.snap?.price?.toFixed(2) ?? "N/A"} | Market cap: ${mktCapStr}
 P/E: ${candidate.snap?.pe?.toFixed(1) ?? "N/A"} | EV/EBITDA: ${candidate.snap?.evToEbitda?.toFixed(1) ?? "N/A"}
 Gross margin: ${candidate.snap?.grossMarginTTM ? (candidate.snap.grossMarginTTM * 100).toFixed(1) + "%" : "N/A"}
-Revenue growth YoY: ${candidate.snap?.revenueGrowthTTM ? (candidate.snap.revenueGrowthTTM * 100).toFixed(1) + "%" : "N/A"}`.trim();
+Revenue growth YoY: ${candidate.snap?.revenueGrowthTTM ? (candidate.snap.revenueGrowthTTM * 100).toFixed(1) + "%" : "N/A"}`;
 
-  const bullPrompt = `You are a high-conviction equity analyst making the bull case for ${candidate.ticker}.
-${context}
+  const geminiPrompt  = buildAnalysisPrompt(candidate.ticker, candidate.name, context, "Gemini");
+  const deepseekPrompt = buildAnalysisPrompt(candidate.ticker, candidate.name, context, "DeepSeek");
 
-Build the strongest possible bull case. Be specific — use data, supply chain logic, and market dynamics.
-What does the market not understand? What is the magnitude of the opportunity?
-Format:
-MARKET_MISS: [one sentence — the core thing the market has wrong]
-BULL_CASE: [3-4 punchy paragraphs — evidence, upside drivers, why now]
-PRICE_TARGET: [$XX in 18 months with key assumption]`;
-
-  const bearPrompt = `You are a skeptical short-seller stress-testing the thesis on ${candidate.ticker}.
-${context}
-
-Attack the bull case ruthlessly. Find the 3 most damaging weaknesses.
-What would make this thesis completely wrong? What risks are being underpriced?
-Format:
-BEAR_CASE: [3-4 punchy paragraphs — execution risk, competition, valuation, downside]
-INVALIDATION_TRIGGER: [exact condition that would break the thesis — be specific, e.g. "revenue miss >20% for 2 consecutive quarters"]
-WORST_CASE: [$XX in 18 months and why]`;
-
-  // Run bull and bear in parallel
-  const [bullRaw, bearRaw] = await Promise.all([
-    callGemini(bullPrompt, 60000),
-    callDeepSeek(bearPrompt, 50000),
+  // Both models analyze independently, in parallel
+  let [geminiRaw, deepseekRaw] = await Promise.all([
+    callGemini(deepseekPrompt, 70000),   // Gemini gets the same balanced prompt
+    callDeepSeek(geminiPrompt, 60000),   // DeepSeek gets the same balanced prompt
   ]);
 
-  // If DeepSeek not available, run Gemini for bear too
-  const bearFinal = bearRaw || await callGemini(bearPrompt.replace("short-seller", "skeptical analyst"), 60000);
+  // If DeepSeek unavailable, run Gemini again with a different temperature directive
+  if (!deepseekRaw) {
+    deepseekRaw = await callGemini(
+      deepseekPrompt + "\n\nNote: Be more skeptical and weight the bear case higher than usual.",
+      60000
+    );
+  }
 
-  const synthPrompt = `You are the chief investment officer adjudicating a debate about ${candidate.ticker}.
+  const gemini   = parseModelAnalysis(geminiRaw);
+  const deepseek = parseModelAnalysis(deepseekRaw);
 
-BULL CASE (Gemini):
-${bullRaw || "(no bull case generated)"}
+  // Synthesis: compare where they agree vs diverge — divergence = alpha
+  const verdictLine = (v: ModelAnalysis) => `${v.verdict} | Target: ${v.priceTarget} | Floor: ${v.worstCase}`;
+  const synthPrompt = `You are a chief investment officer synthesizing two independent analyses of ${candidate.ticker}.
 
-BEAR CASE (DeepSeek):
-${bearFinal || "(no bear case generated)"}
+═══ GEMINI ANALYSIS ═══
+Verdict: ${gemini.verdict} | Target: ${gemini.priceTarget} | Floor: ${gemini.worstCase}
+Bull: ${gemini.bullCase.slice(0, 500)}
+Bear: ${gemini.bearCase.slice(0, 500)}
+Market miss: ${gemini.marketMiss}
+Invalidation: ${gemini.invalidationTrigger}
 
-Based on this debate, provide your verdict:
+═══ DEEPSEEK ANALYSIS ═══
+Verdict: ${deepseek.verdict} | Target: ${deepseek.priceTarget} | Floor: ${deepseek.worstCase}
+Bull: ${deepseek.bullCase.slice(0, 500)}
+Bear: ${deepseek.bearCase.slice(0, 500)}
+Market miss: ${deepseek.marketMiss}
+Invalidation: ${deepseek.invalidationTrigger}
+
+Your job: find where they agree (high confidence), where they diverge (the alpha), and reach a final verdict.
+
+AGREEMENT: [1-2 sentences — what both models agree on, bull AND bear]
+GEMINI_UNIQUE: [what Gemini sees that DeepSeek misses — the strongest point only]
+DEEPSEEK_UNIQUE: [what DeepSeek sees that Gemini misses — the strongest point only]
+DECISIVE_FACTOR: [the single most important unresolved question — what would tip your verdict]
+MARKET_MISS: [one sentence — the most actionable mispricing insight from the combined analysis]
+INVALIDATION_TRIGGER: [the sharpest, most specific exit condition from either analysis]
 VERDICT: BULL|BEAR|NEUTRAL
-MARKET_MISS: [the single most overlooked insight — one sentence]
-INVALIDATION_TRIGGER: [exact condition that breaks the thesis — one sentence, be specific]
-SYNTHESIS: [2 sentences — who made the stronger argument and why]`;
+SYNTHESIS: [3 sentences — the integrated view, weighting the best arguments from each model]`;
 
-  const synthRaw = await callGemini(synthPrompt, 45000);
+  const synthRaw = await callGemini(synthPrompt, 60000);
 
   const get = (key: string, text: string) => {
     const m = text.match(new RegExp(`^${key}:\\s*(.+)`, "im"));
     return m ? m[1].trim() : "";
   };
+  const getBlock = (key: string, text: string) => {
+    const m = text.match(new RegExp(`^${key}:\\s*\\n([\\s\\S]*?)(?=^[A-Z_]+:|$)`, "im"));
+    return m ? m[1].trim() : get(key, text);
+  };
 
   const verdictStr = get("VERDICT", synthRaw).toUpperCase();
-  const verdict = (verdictStr === "BULL" || verdictStr === "BEAR") ? verdictStr as "BULL" | "BEAR" : "NEUTRAL";
-  const marketMiss = get("MARKET_MISS", synthRaw) || get("MARKET_MISS", bullRaw);
-  const invalidation = get("INVALIDATION_TRIGGER", synthRaw) || get("INVALIDATION_TRIGGER", bearFinal);
+  const verdict: "BULL" | "BEAR" | "NEUTRAL" =
+    verdictStr === "BULL" ? "BULL" : verdictStr === "BEAR" ? "BEAR" : "NEUTRAL";
 
   return {
-    bullCase: bullRaw,
-    bearCase: bearFinal,
-    synthesis: get("SYNTHESIS", synthRaw) || synthRaw.slice(0, 300),
+    gemini,
+    deepseek,
+    agreement:         get("AGREEMENT", synthRaw),
+    geminiUnique:      get("GEMINI_UNIQUE", synthRaw),
+    deepseekUnique:    get("DEEPSEEK_UNIQUE", synthRaw),
+    synthesis:         get("SYNTHESIS", synthRaw) || getBlock("SYNTHESIS", synthRaw),
     verdict,
-    marketMiss,
-    invalidationTrigger: invalidation,
+    marketMiss:        get("MARKET_MISS", synthRaw) || gemini.marketMiss,
+    invalidationTrigger: get("INVALIDATION_TRIGGER", synthRaw) || gemini.invalidationTrigger || deepseek.invalidationTrigger,
   };
 }
 
@@ -458,9 +539,9 @@ async function sendFiveMessages(
     `  ─────────────────────────────`,
     `  OVERALL        ${scores.overall.toFixed(0)}/100`,
     "",
-    "🤺 DEBATE",
-    `  ${verdictEmoji}`,
-    `  ${debate.synthesis.slice(0, 180)}`,
+    "🤺 DEBATE (Gemini + DeepSeek, both sides)",
+    `  Gemini: ${debate.gemini.verdict} | DeepSeek: ${debate.deepseek.verdict} | CIO: ${verdictEmoji}`,
+    `  ${debate.synthesis.slice(0, 160)}`,
     "",
     "⚡ CATALYST",
     `  ${candidate.catalyst.slice(0, 150)}`,
@@ -500,22 +581,37 @@ async function sendFiveMessages(
   ].join("\n");
 
   // ── Message 3: Catalysts & Asymmetry ─────────────────────────────────────
+  const gVerdict = debate.gemini.verdict === "BULL" ? "🟢 BULL" : debate.gemini.verdict === "BEAR" ? "🔴 BEAR" : "🟡 NEUTRAL";
+  const dVerdict = debate.deepseek.verdict === "BULL" ? "🟢 BULL" : debate.deepseek.verdict === "BEAR" ? "🔴 BEAR" : "🟡 NEUTRAL";
+
   const msg3 = [
-    `⚡ $${t} — Catalysts (Next 12 Months)`,
+    `⚡ $${t} — Catalysts + Debate`,
     "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
     "",
     analysis.catalysts || "(see vault report)",
     "",
-    "DEBATE DEEP-DIVE",
-    "┌─────────────────────────────────┐",
-    `│ GEMINI (BULL)                   │`,
-    `│ ${debate.bullCase.slice(0, 120).replace(/\n/g, " ")}...`,
-    "├─────────────────────────────────┤",
-    `│ DEEPSEEK (BEAR)                 │`,
-    `│ ${debate.bearCase.slice(0, 120).replace(/\n/g, " ")}...`,
-    "├─────────────────────────────────┤",
-    `│ VERDICT: ${verdictEmoji.padEnd(25)}│`,
-    "└─────────────────────────────────┘",
+    "🤺 GEMINI vs DEEPSEEK — BILATERAL DEBATE",
+    "┌─────────────────────────────────────────┐",
+    `│ GEMINI  →  ${gVerdict.padEnd(30)}│`,
+    `│ Bull: ${(debate.gemini.bullCase || "").slice(0, 100).replace(/\n/g, " ")}`,
+    `│ Bear: ${(debate.gemini.bearCase || "").slice(0, 100).replace(/\n/g, " ")}`,
+    `│ Target: ${debate.gemini.priceTarget || "N/A"}  |  Floor: ${debate.gemini.worstCase || "N/A"}`,
+    "├─────────────────────────────────────────┤",
+    `│ DEEPSEEK  →  ${dVerdict.padEnd(28)}│`,
+    `│ Bull: ${(debate.deepseek.bullCase || "").slice(0, 100).replace(/\n/g, " ")}`,
+    `│ Bear: ${(debate.deepseek.bearCase || "").slice(0, 100).replace(/\n/g, " ")}`,
+    `│ Target: ${debate.deepseek.priceTarget || "N/A"}  |  Floor: ${debate.deepseek.worstCase || "N/A"}`,
+    "├─────────────────────────────────────────┤",
+    `│ WHERE THEY AGREE                        │`,
+    `│ ${(debate.agreement || "").slice(0, 100).replace(/\n/g, " ")}`,
+    "├─────────────────────────────────────────┤",
+    `│ GEMINI SEES (unique):                   │`,
+    `│ ${(debate.geminiUnique || "").slice(0, 100).replace(/\n/g, " ")}`,
+    `│ DEEPSEEK SEES (unique):                 │`,
+    `│ ${(debate.deepseekUnique || "").slice(0, 100).replace(/\n/g, " ")}`,
+    "├─────────────────────────────────────────┤",
+    `│ CIO VERDICT: ${verdictEmoji.padEnd(27)}│`,
+    "└─────────────────────────────────────────┘",
     "",
     "ASYMMETRY",
     scores.targetPrice ? `  Bull:  $${scores.targetPrice}  (+${scores.upsidePct ?? "?"}%)` : "  Bull:  See vault report",
@@ -658,23 +754,48 @@ Entry: $${snap?.price?.toFixed(2) ?? "N/A"} | Target: ${scores.targetPrice ? `$$
 
 ---
 
-## Gemini — Bull Case
+## Gemini — Full Analysis (Bull + Bear)
 
-${debate.bullCase || "(not generated)"}
+**Verdict:** ${debate.gemini.verdict} | **Target:** ${debate.gemini.priceTarget} | **Floor:** ${debate.gemini.worstCase}
+
+**Bull Case:**
+${debate.gemini.bullCase || "(not generated)"}
+
+**Bear Case:**
+${debate.gemini.bearCase || "(not generated)"}
+
+**Market miss:** ${debate.gemini.marketMiss}
+**Invalidation:** ${debate.gemini.invalidationTrigger}
 
 ---
 
-## DeepSeek — Bear Case
+## DeepSeek — Full Analysis (Bull + Bear)
 
-${debate.bearCase || "(not generated)"}
+**Verdict:** ${debate.deepseek.verdict} | **Target:** ${debate.deepseek.priceTarget} | **Floor:** ${debate.deepseek.worstCase}
+
+**Bull Case:**
+${debate.deepseek.bullCase || "(not generated)"}
+
+**Bear Case:**
+${debate.deepseek.bearCase || "(not generated)"}
+
+**Market miss:** ${debate.deepseek.marketMiss}
+**Invalidation:** ${debate.deepseek.invalidationTrigger}
 
 ---
 
-## Synthesis Verdict
+## Synthesis — Where They Agree vs Diverge
 
+**Agreement (high confidence):** ${debate.agreement}
+
+**Gemini sees (unique insight):** ${debate.geminiUnique}
+
+**DeepSeek sees (unique insight):** ${debate.deepseekUnique}
+
+**CIO Synthesis:**
 ${debate.synthesis}
 
-**Verdict:** ${debate.verdict}
+**Final Verdict:** ${debate.verdict}
 
 **Invalidation trigger:** ${debate.invalidationTrigger}
 
