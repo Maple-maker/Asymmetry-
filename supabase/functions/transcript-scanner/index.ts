@@ -12,9 +12,11 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "jsr:@supabase/supabase-js@2";
 
-const VENICE_KEY  = Deno.env.get("VENICE_API_KEY");
-const GEMINI_KEY  = Deno.env.get("GEMINI_API_KEY");
+const DEEPSEEK_KEY = Deno.env.get("DEEPSEEK_API_KEY");
+const GEMINI_KEY   = Deno.env.get("GEMINI_API_KEY");
 const NTFY_TOPIC  = "asymmetry-radar";
+// Use gemini-2.5-flash for all inference (confirmed working + funded)
+// DeepSeek is an optional secondary if key is set
 const GEMINI_MODEL = "gemini-2.5-flash";
 const GEMINI_BASE  = "https://generativelanguage.googleapis.com/v1beta";
 
@@ -35,62 +37,105 @@ const supabase = createClient(
   Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
 );
 
-// ── Venice AI (web-search enabled) ────────────────────────────────────────────
+// ── Gemini (primary LLM — confirmed funded) ───────────────────────────────────
 
-// Last Venice error — stored so diag endpoint can surface it
-let lastVeniceError = "";
+let lastLLMError = "";
 
-async function callVenice(prompt: string): Promise<string> {
-  if (!VENICE_KEY) { lastVeniceError = "VENICE_API_KEY not set"; return ""; }
+async function callGemini(prompt: string): Promise<string> {
+  if (!GEMINI_KEY) { lastLLMError = "GEMINI_API_KEY not set"; return ""; }
   try {
-    const res = await fetch("https://api.venice.ai/api/v1/chat/completions", {
+    const res = await fetch(
+      `${GEMINI_BASE}/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_KEY}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          generationConfig: { thinkingConfig: { thinkingBudget: 0 } },
+          contents: [{ parts: [{ text: prompt }] }],
+        }),
+        signal: AbortSignal.timeout(90000),
+      },
+    );
+    if (!res.ok) {
+      const errBody = (await res.text()).slice(0, 400);
+      lastLLMError = `gemini HTTP ${res.status}: ${errBody}`;
+      console.error(`[gemini] ${lastLLMError}`);
+      return "";
+    }
+    lastLLMError = "";
+    const data = await res.json();
+    const content = data.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+    console.log(`[gemini] response length: ${content.length} chars`);
+    return content;
+  } catch (e) {
+    lastLLMError = `gemini error: ${String(e)}`;
+    console.error(`[gemini] error: ${String(e)}`);
+    return "";
+  }
+}
+
+// ── DeepSeek (optional secondary — used only if key is set) ──────────────────
+
+async function callDeepSeek(prompt: string): Promise<string> {
+  if (!DEEPSEEK_KEY) return "";
+  try {
+    const res = await fetch("https://api.deepseek.com/v1/chat/completions", {
       method: "POST",
       headers: {
-        "Authorization": `Bearer ${VENICE_KEY}`,
+        "Authorization": `Bearer ${DEEPSEEK_KEY}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: "kimi-k2-5",
+        model: "deepseek-chat",
         messages: [{ role: "user", content: prompt }],
-        venice_parameters: { enable_web_search: "auto" },
         max_tokens: 4000,
+        temperature: 0.3,
       }),
       signal: AbortSignal.timeout(60000),
     });
     if (!res.ok) {
       const errBody = (await res.text()).slice(0, 400);
-      lastVeniceError = `HTTP ${res.status}: ${errBody}`;
-      console.error(`[venice] ${lastVeniceError}`);
+      console.error(`[deepseek] HTTP ${res.status}: ${errBody}`);
       return "";
     }
-    lastVeniceError = "";
     const data = await res.json();
     const content = data.choices?.[0]?.message?.content ?? "";
-    console.log(`[venice] response length: ${content.length} chars`);
+    console.log(`[deepseek] response length: ${content.length} chars`);
     return content;
   } catch (e) {
-    lastVeniceError = String(e);
-    console.error(`[venice] error: ${lastVeniceError}`);
+    console.error(`[deepseek] error: ${String(e)}`);
     return "";
   }
 }
 
-// Quick Venice ping — sends a tiny prompt to check connectivity and auth
-async function pingVenice(): Promise<{ ok: boolean; status?: number; error?: string; latency_ms: number }> {
-  if (!VENICE_KEY) return { ok: false, error: "VENICE_API_KEY not set", latency_ms: 0 };
+// ── Unified LLM caller: DeepSeek first (if key set), else Gemini ─────────────
+// Gemini is the confirmed-funded primary; DeepSeek is enhancement if available.
+
+async function callLLM(prompt: string): Promise<string> {
+  // Try DeepSeek first if key is available
+  if (DEEPSEEK_KEY) {
+    const result = await callDeepSeek(prompt);
+    if (result) return result;
+    console.log("[llm] DeepSeek failed, falling back to Gemini");
+  }
+  // Gemini is the reliable fallback (confirmed working)
+  return callGemini(prompt);
+}
+
+async function pingDeepSeek(): Promise<{ ok: boolean; status?: number; error?: string; latency_ms: number }> {
+  if (!DEEPSEEK_KEY) return { ok: false, error: "DEEPSEEK_API_KEY not set", latency_ms: 0 };
   const t0 = Date.now();
   try {
-    const res = await fetch("https://api.venice.ai/api/v1/chat/completions", {
+    const res = await fetch("https://api.deepseek.com/v1/chat/completions", {
       method: "POST",
       headers: {
-        "Authorization": `Bearer ${VENICE_KEY}`,
+        "Authorization": `Bearer ${DEEPSEEK_KEY}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: "kimi-k2-5",
+        model: "deepseek-chat",
         messages: [{ role: "user", content: "Reply: OK" }],
-        venice_parameters: { enable_web_search: "off" },
-        max_tokens: 10,
+        max_tokens: 5,
       }),
       signal: AbortSignal.timeout(20000),
     });
@@ -102,35 +147,6 @@ async function pingVenice(): Promise<{ ok: boolean; status?: number; error?: str
     return { ok: true, status: res.status, latency_ms };
   } catch (e) {
     return { ok: false, error: String(e), latency_ms: Date.now() - t0 };
-  }
-}
-
-// ── Gemini synthesis ──────────────────────────────────────────────────────────
-
-async function callGemini(prompt: string): Promise<string> {
-  if (!GEMINI_KEY) return "";
-  try {
-    const res = await fetch(
-      `${GEMINI_BASE}/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_KEY}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          generationConfig: { thinkingConfig: { thinkingBudget: 0 } },
-          contents: [{ parts: [{ text: prompt }] }],
-        }),
-        signal: AbortSignal.timeout(45000),
-      },
-    );
-    if (!res.ok) {
-      console.error(`[gemini] ${res.status}: ${(await res.text()).slice(0, 200)}`);
-      return "";
-    }
-    const data = await res.json();
-    return data.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
-  } catch (e) {
-    console.error(`[gemini] error: ${String(e)}`);
-    return "";
   }
 }
 
@@ -237,10 +253,10 @@ function parseBeneficiaries(text: string, _company: string): Beneficiary[] {
 function buildSignalPrompt(company: string, ticker: string): string {
   return `You are an investment signal extractor. Your job is to find what ${company} (${ticker}) NEEDS from external suppliers, partners, and smaller companies — NOT what they build themselves.
 
-Search the internet for ${company}'s most recent:
-- Earnings call transcript (last 2 quarters)
+Draw on your knowledge of ${company}'s most recent:
+- Earnings call transcripts (last 2 quarters) — CEO/CFO/CTO statements
 - Investor Day / analyst day presentations
-- Executive interviews and public speeches (last 6 months)
+- Executive interviews and public speeches
 - Supply chain disclosures in 10-K/10-Q filings
 
 Focus EXCLUSIVELY on statements where executives signal:
@@ -259,7 +275,7 @@ QUOTE: "[exact executive quote or close paraphrase with attribution]"
 SPEAKER: [Name, Title]
 BENEFICIARY_TYPE: [specific type of smaller company that would benefit — be precise, e.g. "HBM DRAM manufacturer", "fiber optic transceiver maker", "AI inference chip startup"]
 URGENCY: HIGH|MEDIUM|LOW
-SOURCE_URL: [direct URL to the earnings call transcript, investor day recording, interview, or filing where you found this — be specific]
+SOURCE_URL: [best known public URL for this source — earnings call transcript page, SEC filing, investor relations page, or leave blank if unknown]
 ---END---
 
 Extract 4-8 signals. Prioritize HIGH urgency signals where the need is explicit and the beneficiary type is specific and investable. Skip vague or generic statements.
@@ -302,7 +318,7 @@ Focus especially on: what does Musk say he needs EXTERNALLY for Grok/Dojo/Starli
 
   return `You are an investment signal extractor. ${companyName} is a PRIVATE AI company (not publicly traded). Your job is to find what ${companyName} NEEDS from external suppliers, partners, and smaller companies — NOT what they build themselves.
 
-Search the internet for ${companyName}'s most recent public statements (last 90 days):
+Draw on your knowledge of ${companyName}'s recent public statements:
 ${hints}
 
 Focus EXCLUSIVELY on signals where ${companyName} reveals:
@@ -321,7 +337,7 @@ QUOTE: "[exact quote or close paraphrase — cite the source: blog post title, i
 SPEAKER: [Name, Title, Source]
 BENEFICIARY_TYPE: [specific type of smaller company that would benefit — be precise, e.g. "liquid cooling data center specialist", "custom ASIC designer", "synthetic training data provider"]
 URGENCY: HIGH|MEDIUM|LOW
-SOURCE_URL: [direct URL to the blog post, interview, paper, or job posting where you found this — be specific]
+SOURCE_URL: [best known public URL for this source — blog post, interview, paper, or leave blank if unknown]
 ---END---
 
 Extract 4-8 signals. Prioritize HIGH urgency signals where the need is explicit and near-term. Skip vague or generic statements.
@@ -329,7 +345,7 @@ Extract 4-8 signals. Prioritize HIGH urgency signals where the need is explicit 
 IMPORTANT: Only surface signals where the beneficiary is a SMALLER EXTERNAL company — not ${companyName} itself, not other big tech firms.`;
 }
 
-// ── Beneficiary search prompt (Venice call 2) ─────────────────────────────────
+// ── Beneficiary search prompt (DeepSeek call 2) ──────────────────────────────
 
 function buildBeneficiaryPrompt(company: string, signals: Signal[]): string {
   const signalList = signals.map((s, i) =>
@@ -542,39 +558,40 @@ async function runScan(ticker: string, company: string, isPublic: boolean): Prom
 }> {
   console.log(`[scanner] Starting scan: ${company} (${ticker}) | public=${isPublic}`);
 
-  // ── Venice call 1: extract signals ────────────────────────────────────────
+  // ── LLM call 1: extract signals ──────────────────────────────────────────
   // Use a different prompt for private AI labs — they don't have earnings calls
+  // Primary: Gemini (confirmed funded). Secondary: DeepSeek (if key set).
   const signalPrompt = isPublic
     ? buildSignalPrompt(company, ticker)
     : buildPrivateLabSignalPrompt(company, ticker);
 
-  const rawSignals = await callVenice(signalPrompt);
+  const rawSignals = await callLLM(signalPrompt);
   const signals    = parseSignals(rawSignals);
-  console.log(`[scanner] ${ticker}: extracted ${signals.length} signals`);
+  console.log(`[scanner] ${ticker}: extracted ${signals.length} signals, raw_chars=${rawSignals.length}`);
 
-  // ── Venice call 2: find beneficiaries ─────────────────────────────────────
+  // ── LLM call 2: find beneficiaries ───────────────────────────────────────
   let beneficiaries: Beneficiary[] = [];
   let rawBeneficiaries = "";
   if (signals.length > 0) {
     const benPrompt    = buildBeneficiaryPrompt(company, signals);
-    rawBeneficiaries   = await callVenice(benPrompt);
+    rawBeneficiaries   = await callLLM(benPrompt);
     beneficiaries      = parseBeneficiaries(rawBeneficiaries, company);
     console.log(`[scanner] ${ticker}: found ${beneficiaries.length} beneficiaries`);
   }
 
-  // ── Gemini synthesis ──────────────────────────────────────────────────────
+  // ── Gemini synthesis (always Gemini — it's the reasoning/ranking step) ───
   let synthesis = "";
   if (beneficiaries.length > 0) {
     const synthPrompt = buildGeminiSynthesisPrompt(company, signals, beneficiaries);
     synthesis         = await callGemini(synthPrompt);
-    console.log(`[scanner] ${ticker}: Gemini synthesis complete (${synthesis.length} chars)`);
+    console.log(`[scanner] ${ticker}: synthesis complete (${synthesis.length} chars)`);
   }
 
   // ── Save scan record to DB ────────────────────────────────────────────────
-  // Always save raw_extraction even if empty — include Venice error for debugging
+  // Always save raw_extraction even if empty — include error for debugging
   const rawExtractionParts = [rawSignals, rawBeneficiaries].filter(Boolean);
-  if (rawExtractionParts.length === 0 && lastVeniceError) {
-    rawExtractionParts.push(`[VENICE ERROR] ${lastVeniceError}`);
+  if (rawExtractionParts.length === 0 && lastLLMError) {
+    rawExtractionParts.push(`[LLM ERROR] ${lastLLMError}`);
   }
   const { data: scanRow, error: scanErr } = await supabase
     .from("tech_signal_scans")
@@ -751,8 +768,9 @@ Deno.serve(async (req: Request) => {
   // ── Diagnostics ────────────────────────────────────────────────────────────
   if (diagMode) {
     const diag: Record<string, unknown> = {
-      venice_key_set: !!VENICE_KEY,
+      deepseek_key_set: !!DEEPSEEK_KEY,
       gemini_key_set: !!GEMINI_KEY,
+      primary_llm: DEEPSEEK_KEY ? "deepseek (with gemini fallback)" : "gemini (primary)",
       timestamp: new Date().toISOString(),
     };
 
@@ -768,8 +786,8 @@ Deno.serve(async (req: Request) => {
       .select("id", { count: "exact", head: true });
     diag.scan_count = count;
 
-    // Venice connectivity test
-    diag.venice_ping = await pingVenice();
+    // DeepSeek connectivity test
+    diag.deepseek_ping = await pingDeepSeek();
 
     if (GEMINI_KEY) {
       try {
@@ -865,7 +883,7 @@ Deno.serve(async (req: Request) => {
       added_to_watchlist: addedToWatchlist,
       synthesis_length: synthesis.length,
       vault_path: vaultPath || null,
-      ...(lastVeniceError ? { venice_error: lastVeniceError } : {}),
+      ...(lastLLMError ? { llm_error: lastLLMError } : {}),
     }, null, 2),
     { headers: { "Content-Type": "application/json" } },
   );
