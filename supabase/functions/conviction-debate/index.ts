@@ -183,11 +183,6 @@ interface Candidate {
   snap: FMPSnapshot | null;
 }
 
-function progressBar(score: number, max = 10): string {
-  const filled = Math.round((score / max) * 8);
-  return "█".repeat(filled) + "░".repeat(8 - filled);
-}
-
 async function batchScoreCandidates(candidates: Candidate[]): Promise<Map<string, ConvictionScores>> {
   const blocks = candidates.map((c, i) => {
     const price = c.snap?.price ?? 0;
@@ -353,10 +348,10 @@ Revenue growth YoY: ${candidate.snap?.revenueGrowthTTM ? (candidate.snap.revenue
   const geminiPrompt  = buildAnalysisPrompt(candidate.ticker, candidate.name, context, "Gemini");
   const deepseekPrompt = buildAnalysisPrompt(candidate.ticker, candidate.name, context, "DeepSeek");
 
-  // Both models analyze independently, in parallel
+  // Both models analyze independently, in parallel — each gets its own persona prompt
   let [geminiRaw, deepseekRaw] = await Promise.all([
-    callGemini(deepseekPrompt, 70000),   // Gemini gets the same balanced prompt
-    callDeepSeek(geminiPrompt, 60000),   // DeepSeek gets the same balanced prompt
+    callGemini(geminiPrompt, 70000),
+    callDeepSeek(deepseekPrompt, 60000),
   ]);
 
   // If DeepSeek unavailable, run Gemini again with a different temperature directive
@@ -371,7 +366,6 @@ Revenue growth YoY: ${candidate.snap?.revenueGrowthTTM ? (candidate.snap.revenue
   const deepseek = parseModelAnalysis(deepseekRaw);
 
   // Synthesis: compare where they agree vs diverge — divergence = alpha
-  const verdictLine = (v: ModelAnalysis) => `${v.verdict} | Target: ${v.priceTarget} | Floor: ${v.worstCase}`;
   const synthPrompt = `You are a chief investment officer synthesizing two independent analyses of ${candidate.ticker}.
 
 ═══ GEMINI ANALYSIS ═══
