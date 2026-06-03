@@ -39,6 +39,11 @@ struct Opportunity: Identifiable, Codable {
     let upsidePct: Double?
     let downsidePct: Double?
 
+    // Triple Signal
+    let isTripleSignal: Bool
+    let smartMoneyScore: Int?
+    let marketCapScore: Int?
+
     enum CodingKeys: String, CodingKey {
         case id, ticker
         case companyName = "company_name"
@@ -70,6 +75,9 @@ struct Opportunity: Identifiable, Codable {
         case floorPrice = "floor_price"
         case upsidePct = "upside_pct"
         case downsidePct = "downside_pct"
+        case isTripleSignal = "is_triple_signal"
+        case smartMoneyScore = "smart_money_score"
+        case marketCapScore = "market_cap_score"
     }
 }
 
@@ -147,6 +155,9 @@ extension Opportunity {
         targetPrice: 32.0,
         floorPrice: 6.50,
         upsidePct: 181,
-        downsidePct: 43
+        downsidePct: 43,
+        isTripleSignal: true,
+        smartMoneyScore: 8,
+        marketCapScore: 8
     )
 }

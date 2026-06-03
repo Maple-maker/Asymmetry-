@@ -65,14 +65,31 @@ struct OpportunityCard: View {
     private var headerRow: some View {
         HStack(alignment: .top) {
             VStack(alignment: .leading, spacing: 4) {
-                // Tier badge
-                Text(opportunity.tier.tierShort)
-                    .font(DS.Font.caption(10))
-                    .foregroundColor(opportunity.tier.tierColor)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 3)
-                    .background(opportunity.tier.tierColor.opacity(0.15))
-                    .clipShape(Capsule())
+                // Badge row: tier + optional triple signal
+                HStack(spacing: 6) {
+                    Text(opportunity.tier.tierShort)
+                        .font(DS.Font.caption(10))
+                        .foregroundColor(opportunity.tier.tierColor)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(opportunity.tier.tierColor.opacity(0.15))
+                        .clipShape(Capsule())
+
+                    if opportunity.isTripleSignal {
+                        HStack(spacing: 3) {
+                            Image(systemName: "bolt.fill")
+                                .font(.system(size: 9, weight: .bold))
+                            Text("TRIPLE SIGNAL")
+                                .font(DS.Font.caption(9))
+                        }
+                        .foregroundColor(DS.Color.tier1)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(DS.Color.tier1.opacity(0.15))
+                        .clipShape(Capsule())
+                        .overlay(Capsule().stroke(DS.Color.tier1.opacity(0.4), lineWidth: 0.5))
+                    }
+                }
 
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
                     Text("$\(opportunity.ticker)")

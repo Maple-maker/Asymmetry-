@@ -163,6 +163,9 @@ Deno.serve(async (req) => {
           floor_price:          floorPrice,
           upside_pct:           upsidePct,
           downside_pct:         downsidePct,
+          is_triple_signal:     (debate.is_triple_signal as boolean) ?? false,
+          smart_money_score:    (debate.smart_money_score as number | null) ?? null,
+          market_cap_score:     (debate.market_cap_score as number | null) ?? null,
         };
 
         const { error: insertErr } = await supabase

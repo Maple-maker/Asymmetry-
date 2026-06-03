@@ -2,7 +2,8 @@
 // Schedule: daily at 9:30 AM UTC via pg_cron (30 9 * * *)
 // Purpose: score HIGH-confidence beneficiaries from today's transcript scan,
 //          run Gemini (bull) vs DeepSeek (bear) debate, pick best candidate,
-//          run full deep analysis, fire 5-message ntfy report + vault push.
+//          run full deep analysis, fire single ntfy alert + vault push.
+//          Triple Signal boost: market cap + catalyst + smart money (Form 4) all ≥ 7 → +15 pts.
 //
 // POST {}              → process today's scan (auto-detect latest)
 // POST {"scan_id": N}  → process a specific scan
@@ -155,6 +156,118 @@ async function getFMPSnapshot(ticker: string): Promise<FMPSnapshot | null> {
     console.error(`[fmp:${ticker}] ${String(e)}`);
     return null;
   }
+}
+
+// ── Triple Signal engine ──────────────────────────────────────────────────────
+// Three hard data signals: market cap (size = asymmetry potential),
+// catalyst quality (event-driven repricing), smart money (insider conviction).
+// When all three align at ≥ 7/10, add +15 to overall before the 75 threshold gate.
+
+interface InsiderSignal {
+  score: number;         // 1-10
+  recentBuys: number;
+  recentSales: number;
+  cSuiteBuying: boolean;
+  largestBuyUSD: number;
+  summary: string;
+}
+
+interface MarketCapSignal {
+  score: number;         // 1-10 (inverse: smaller = higher score)
+  label: string;
+  mktCap: number;
+}
+
+interface TripleSignal {
+  isTriple: boolean;
+  boost: number;         // +15 if all three ≥ 7, else 0
+  marketCap: MarketCapSignal;
+  insider: InsiderSignal;
+  catalystScore: number;
+  explanation: string;
+}
+
+function calcMarketCapScore(mktCap: number | null): MarketCapSignal {
+  if (!mktCap || mktCap <= 0) return { score: 5, label: "Unknown", mktCap: 0 };
+  if (mktCap <   300_000_000) return { score: 10, label: "Micro-cap (<$300M)", mktCap };
+  if (mktCap < 1_000_000_000) return { score: 8,  label: "Small-cap (<$1B)",   mktCap };
+  if (mktCap < 3_000_000_000) return { score: 7,  label: "Small-mid (<$3B)",   mktCap };
+  if (mktCap < 10_000_000_000) return { score: 5, label: "Mid-cap (<$10B)",    mktCap };
+  if (mktCap < 50_000_000_000) return { score: 3, label: "Large-cap (<$50B)",  mktCap };
+  return { score: 1, label: "Mega-cap (>$50B)", mktCap };
+}
+
+async function getInsiderSignal(ticker: string): Promise<InsiderSignal> {
+  const fallback: InsiderSignal = { score: 5, recentBuys: 0, recentSales: 0, cSuiteBuying: false, largestBuyUSD: 0, summary: "No data" };
+  if (!FMP_KEY) return fallback;
+  try {
+    const res = await fetch(
+      `https://financialmodelingprep.com/api/v4/insider-trading?symbol=${ticker}&limit=30&apikey=${FMP_KEY}`,
+      { signal: AbortSignal.timeout(10000) },
+    );
+    if (!res.ok) return fallback;
+    const data = await res.json();
+    if (!Array.isArray(data) || data.length === 0) {
+      return { ...fallback, score: 3, summary: "No recent insider transactions" };
+    }
+
+    // Last 60 days only
+    const cutoff = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    const recent = data.filter((t: Record<string, string>) => (t.transactionDate ?? "") >= cutoff);
+    const buys  = recent.filter((t: Record<string, string>) => t.transactionType === "P");
+    const sales = recent.filter((t: Record<string, string>) => t.transactionType === "S");
+
+    const largestBuyUSD = buys.reduce((mx: number, t: Record<string, number>) => Math.max(mx, t.totalTransaction ?? 0), 0);
+    const cSuiteBuying  = buys.some((t: Record<string, string>) => {
+      const role = (t.typeOfOwner ?? t.reportingTitle ?? "").toLowerCase();
+      return role.includes("ceo") || role.includes("cfo") || role.includes("chief") || role.includes("president");
+    });
+    const clusterBuying = buys.length >= 3;
+
+    let score = 5;
+    if (buys.length === 0 && sales.length === 0) score = 4;          // silence
+    else if (sales.length > buys.length * 2)     score = 2;          // heavy net selling
+    else if (clusterBuying && cSuiteBuying)       score = 10;        // cluster + CEO/CFO
+    else if (clusterBuying)                       score = 9;         // 3+ insiders buying
+    else if (cSuiteBuying && largestBuyUSD > 200_000) score = 9;     // large C-suite buy
+    else if (cSuiteBuying && largestBuyUSD > 50_000)  score = 8;
+    else if (cSuiteBuying)                        score = 7;
+    else if (buys.length >= 2)                    score = 7;
+    else if (buys.length === 1 && largestBuyUSD > 100_000) score = 6;
+    else if (buys.length === 1)                   score = 5;
+    else if (sales.length > 0)                    score = 3;
+
+    const buyDesc = buys.length > 0
+      ? `${buys.length} open-market buy${buys.length > 1 ? "s" : ""}${cSuiteBuying ? " (C-suite)" : ""}${largestBuyUSD > 0 ? ` — largest $${(largestBuyUSD / 1000).toFixed(0)}K` : ""}`
+      : sales.length > 0 ? `${sales.length} insider sale${sales.length > 1 ? "s" : ""}, no buying`
+      : "No recent Form 4 activity";
+
+    console.log(`[insider:${ticker}] score=${score} buys=${buys.length} sales=${sales.length} cSuite=${cSuiteBuying}`);
+    return { score, recentBuys: buys.length, recentSales: sales.length, cSuiteBuying, largestBuyUSD, summary: buyDesc };
+  } catch (e) {
+    console.warn(`[insider:${ticker}] ${String(e)}`);
+    return fallback;
+  }
+}
+
+async function analyzeTripleSignal(candidate: Candidate, catalystScore: number): Promise<TripleSignal> {
+  const marketCap = calcMarketCapScore(candidate.snap?.mktCap ?? null);
+  const insider   = await getInsiderSignal(candidate.ticker);
+
+  const isTriple = marketCap.score >= 7 && catalystScore >= 7 && insider.score >= 6;
+  const boost    = isTriple ? 15 : 0;
+
+  const parts: string[] = [];
+  if (marketCap.score >= 7)  parts.push(`${marketCap.label} (${marketCap.score}/10)`);
+  if (catalystScore >= 7)    parts.push(`Catalyst strength ${catalystScore}/10`);
+  if (insider.score >= 6)    parts.push(`Smart money: ${insider.summary}`);
+
+  const explanation = isTriple
+    ? `⚡ TRIPLE SIGNAL: ${parts.join(" · ")}`
+    : `Signals: Market cap ${marketCap.score}/10 · Catalyst ${catalystScore}/10 · Smart money ${insider.score}/10`;
+
+  console.log(`[triple:${candidate.ticker}] ${explanation}`);
+  return { isTriple, boost, marketCap, insider, catalystScore, explanation };
 }
 
 // ── Conviction scoring (batch) ────────────────────────────────────────────────
@@ -504,6 +617,7 @@ async function sendSingleAlert(
   debate: DebateResult,
   analysis: DeepAnalysis,
   vaultPath: string,
+  triple: TripleSignal,
 ): Promise<void> {
   const t = candidate.ticker;
   const tierLabel = scores.tier === 1 ? "TIER 1 — EXCEPTIONAL" : scores.tier === 2 ? "TIER 2 — HIGH CONVICTION" : "TIER 3 — WATCH";
@@ -520,7 +634,7 @@ async function sendSingleAlert(
   })();
 
   const msg = [
-    `${tierEmoji} ${tierLabel} — $${t}  |  ${candidate.name}`,
+    `${triple.isTriple ? "⚡ " : ""}${tierEmoji} ${tierLabel} — $${t}  |  ${candidate.name}`,
     "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
     "",
     "⚡ BLUF",
@@ -535,6 +649,12 @@ async function sendSingleAlert(
     "🏢 BUSINESS MODEL",
     bizModel,
     "",
+    ...(triple.isTriple ? [
+      "⚡ TRIPLE SIGNAL — ALL 3 ALIGNED",
+      triple.explanation,
+      `  MktCap ${triple.marketCap.score}/10 · Catalyst ${triple.catalystScore}/10 · SmartMoney ${triple.insider.score}/10`,
+      "",
+    ] : []),
     `📊 SCORE  ${scores.overall.toFixed(0)}/100  |  ${tierLabel}`,
     `  Asymmetry ${scores.asymmetry}/10 · Conviction ${scores.conviction}/10 · Catalyst ${scores.catalyst}/10 · Mgmt ${scores.management}/10`,
     `  Debate: Gemini=${gV} | DeepSeek=${dV} | CIO=${cioV}`,
@@ -542,8 +662,9 @@ async function sendSingleAlert(
     vaultPath ? `📁 FULL REPORT\n  ${vaultPath}` : "📁 FULL REPORT\n  (vault push failed — check logs)",
   ].join("\n");
 
-  const priority = scores.tier === 1 ? 5 : 4;
-  await notify(`${tierEmoji} $${t} — ${scores.overall.toFixed(0)}/100 | ${debate.verdict}`, msg, priority);
+  const priority = triple.isTriple || scores.tier === 1 ? 5 : 4;
+  const titlePrefix = triple.isTriple ? "⚡ " : "";
+  await notify(`${titlePrefix}${tierEmoji} $${t} — ${scores.overall.toFixed(0)}/100 | ${debate.verdict}`, msg, priority);
 }
 
 // ── GitHub vault push ─────────────────────────────────────────────────────────
@@ -596,6 +717,7 @@ function generateDebateReport(
   scores: ConvictionScores,
   debate: DebateResult,
   analysis: DeepAnalysis,
+  triple: TripleSignal,
 ): string {
   const snap = candidate.snap;
   const fmtNum = (n: number | null, suffix = "", dec = 1) => n != null ? `${n.toFixed(dec)}${suffix}` : "N/A";
@@ -710,6 +832,22 @@ ${analysis.catalysts}
 
 ---
 
+## Triple Signal Analysis
+
+${triple.isTriple ? "### ⚡ TRIPLE SIGNAL ACTIVE — +15 conviction boost applied\n" : ""}
+
+| Signal | Score | Detail |
+|---|---|---|
+| Market Cap | ${triple.marketCap.score}/10 | ${triple.marketCap.label} |
+| Catalyst Strength | ${triple.catalystScore}/10 | ${triple.catalystScore >= 7 ? "✅ Qualifies" : "⚠️ Below threshold"} |
+| Smart Money (Form 4) | ${triple.insider.score}/10 | ${triple.insider.summary} |
+
+${triple.insider.cSuiteBuying ? `**C-Suite buying confirmed.** Largest open-market purchase: $${(triple.insider.largestBuyUSD / 1000).toFixed(0)}K` : ""}
+
+_${triple.explanation}_
+
+---
+
 ## Bear Case — 3 Red Flags
 
 ${analysis.bearFlags}
@@ -806,9 +944,31 @@ Deno.serve(async (req) => {
       .map(c => ({ candidate: c, scores: scoreMap.get(c.ticker) ?? { asymmetry: 5, conviction: 5, catalyst: 5, management: 5, overall: 50, tier: 3, targetPrice: null, floorPrice: null, upsidePct: null, downsidePct: null } }))
       .sort((a, b) => b.scores.overall - a.scores.overall);
 
+    // 4b. Triple Signal analysis — boost scores BEFORE threshold gate so a genuine
+    //     triple signal (small-cap + catalyst + insider buying) is never filtered out.
+    console.log("[debate] analyzing triple signal (market cap + catalyst + smart money)...");
+    const tripleMap = new Map<string, TripleSignal>();
+    await Promise.all(ranked.map(async item => {
+      const triple = await analyzeTripleSignal(item.candidate, item.scores.catalyst);
+      tripleMap.set(item.candidate.ticker, triple);
+      if (triple.boost > 0) {
+        item.scores.overall = Math.min(100, item.scores.overall + triple.boost);
+        console.log(`[debate] ⚡ Triple Signal boost: ${item.candidate.ticker} +${triple.boost} → ${item.scores.overall.toFixed(0)}`);
+      }
+    }));
+    // Re-sort after boosts
+    ranked.sort((a, b) => b.scores.overall - a.scores.overall);
+
     const winner = ranked[0];
+    const winnerTriple = tripleMap.get(winner.candidate.ticker) ?? {
+      isTriple: false, boost: 0,
+      marketCap: { score: 5, label: "Unknown", mktCap: 0 },
+      insider: { score: 5, recentBuys: 0, recentSales: 0, cSuiteBuying: false, largestBuyUSD: 0, summary: "No data" },
+      catalystScore: winner.scores.catalyst,
+      explanation: "",
+    };
     const MIN_SCORE = 75;
-    console.log(`[debate] winner: ${winner.candidate.ticker} (${winner.scores.overall.toFixed(0)}/100)`);
+    console.log(`[debate] winner: ${winner.candidate.ticker} (${winner.scores.overall.toFixed(0)}/100)${winnerTriple.isTriple ? " ⚡ TRIPLE SIGNAL" : ""}`);
 
     if (winner.scores.overall < MIN_SCORE) {
       console.log(`[debate] top score ${winner.scores.overall.toFixed(0)} < ${MIN_SCORE} — skipping debate, no notification`);
@@ -817,7 +977,11 @@ Deno.serve(async (req) => {
         threshold: MIN_SCORE,
         top_score: winner.scores.overall,
         winner: winner.candidate.ticker,
-        all_ranked: ranked.map(r => ({ ticker: r.candidate.ticker, score: r.scores.overall.toFixed(0) })),
+        all_ranked: ranked.map(r => ({
+          ticker: r.candidate.ticker,
+          score: r.scores.overall.toFixed(0),
+          triple: tripleMap.get(r.candidate.ticker)?.isTriple ?? false,
+        })),
       });
     }
 
@@ -833,25 +997,34 @@ Deno.serve(async (req) => {
     // 7. Push vault report
     const date = new Date().toISOString().slice(0, 10);
     const vaultPathTarget = `vault/debates/${winner.candidate.ticker}_${date}.md`;
-    const md = generateDebateReport(winner.candidate, winner.scores, debate, analysis);
+    const md = generateDebateReport(winner.candidate, winner.scores, debate, analysis, winnerTriple);
     const vaultPath = await pushVault(vaultPathTarget, md);
 
     // 8. Send single-message ntfy alert
     console.log("[debate] sending ntfy alert...");
-    await sendSingleAlert(winner.candidate, winner.scores, debate, analysis, vaultPath);
+    await sendSingleAlert(winner.candidate, winner.scores, debate, analysis, vaultPath, winnerTriple);
 
     // 9. Persist result to DB
     const { data: debateRow } = await supabase.from("conviction_debates").insert({
-      ticker:           winner.candidate.ticker,
-      company_name:     winner.candidate.name,
-      source_scan_id:   unique[0]?.scan_id ?? null,
-      overall_score:    winner.scores.overall,
-      tier:             winner.scores.tier,
-      debate_verdict:   debate.verdict,
-      market_miss:      debate.marketMiss,
-      invalidation:     debate.invalidationTrigger,
-      vault_path:       vaultPath || null,
-      all_candidates:   ranked.map(r => ({ ticker: r.candidate.ticker, score: r.scores.overall })),
+      ticker:            winner.candidate.ticker,
+      company_name:      winner.candidate.name,
+      source_scan_id:    unique[0]?.scan_id ?? null,
+      overall_score:     winner.scores.overall,
+      tier:              winner.scores.tier,
+      debate_verdict:    debate.verdict,
+      market_miss:       debate.marketMiss,
+      invalidation:      debate.invalidationTrigger,
+      vault_path:        vaultPath || null,
+      all_candidates:    ranked.map(r => ({ ticker: r.candidate.ticker, score: r.scores.overall })),
+      asymmetry_score:   winner.scores.asymmetry,
+      conviction_score:  winner.scores.conviction,
+      catalyst_score:    winner.scores.catalyst,
+      management_score:  winner.scores.management,
+      target_price:      winner.scores.targetPrice,
+      floor_price:       winner.scores.floorPrice,
+      is_triple_signal:  winnerTriple.isTriple,
+      smart_money_score: winnerTriple.insider.score,
+      market_cap_score:  winnerTriple.marketCap.score,
     }).select("id").single().then(r => { if (r.error) console.warn(`[db] insert warning: ${r.error.message}`); return r; });
 
     // 10. Publish to app feed (fire-and-forget)
@@ -875,7 +1048,13 @@ Deno.serve(async (req) => {
       verdict: debate.verdict,
       market_miss: debate.marketMiss,
       vault_path: vaultPath || null,
-      all_ranked: ranked.map(r => ({ ticker: r.candidate.ticker, score: r.scores.overall.toFixed(0) })),
+      triple_signal: winnerTriple.isTriple,
+      triple_explanation: winnerTriple.explanation,
+      all_ranked: ranked.map(r => ({
+        ticker: r.candidate.ticker,
+        score: r.scores.overall.toFixed(0),
+        triple: tripleMap.get(r.candidate.ticker)?.isTriple ?? false,
+      })),
     });
 
   } catch (e) {
