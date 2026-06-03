@@ -31,7 +31,8 @@ from tools.venice_client import VeniceClient
 # Constants
 # ---------------------------------------------------------------------------
 
-TECH_GIANTS = {
+# Public companies — scanned via earnings calls / investor presentations
+TECH_GIANTS_PUBLIC = {
     "NVDA": "NVIDIA Corporation",
     "AMD":  "Advanced Micro Devices",
     "GOOG": "Alphabet / Google",
@@ -44,7 +45,20 @@ TECH_GIANTS = {
     "INTC": "Intel",
 }
 
-EXCLUDED_TICKERS = set(TECH_GIANTS.keys()) | {"GOOGL"}
+# Private AI labs — scanned via blogs / interviews / job postings / papers
+# These are signal-rich sources but not publicly traded.
+TECH_GIANTS_PRIVATE = {
+    "ANTHROPIC": "Anthropic",
+    "OPENAI":    "OpenAI",
+    "XAI":       "xAI / Elon Musk",
+}
+
+TECH_GIANTS = {**TECH_GIANTS_PUBLIC, **TECH_GIANTS_PRIVATE}
+
+# Exclude public tech giants from beneficiary results (they can't be a buy signal for themselves).
+# Private lab pseudo-tickers are intentionally NOT excluded — they won't realistically appear in
+# equity research output, and if they did they'd be nonsensical picks anyway.
+EXCLUDED_TICKERS = set(TECH_GIANTS_PUBLIC.keys()) | {"GOOGL"}
 
 WATCHLIST_FILE = os.path.join(ROOT_DIR, "vault", "tech_signal_watchlist.json")
 
@@ -127,6 +141,7 @@ def parse_beneficiaries(text: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def build_signal_prompt(ticker: str, company: str) -> str:
+    """Signal extraction prompt for PUBLIC companies (earnings calls, 10-K, investor days)."""
     return f"""You are an investment signal extractor. Your job is to find what {company} ({ticker}) NEEDS from external suppliers, partners, and smaller companies — NOT what they build themselves.
 
 Search the internet for {company}'s most recent:
@@ -156,6 +171,77 @@ URGENCY: HIGH|MEDIUM|LOW
 Extract 4-8 signals. Prioritize HIGH urgency signals where the need is explicit and the beneficiary type is specific and investable. Skip vague or generic statements.
 
 IMPORTANT: Only surface signals where the beneficiary is a SMALLER EXTERNAL company — not {company} itself, not other tech giants."""
+
+
+def build_private_lab_signal_prompt(ticker: str, company: str) -> str:
+    """Signal extraction prompt for PRIVATE AI labs (blogs, interviews, job postings, papers).
+
+    These companies don't have earnings calls or SEC filings, so we scrape public
+    statements, technical reports, partnership announcements, and job postings instead.
+    """
+    lab_hints: dict[str, str] = {
+        "ANTHROPIC": (
+            "- Official research blog: anthropic.com/research (model cards, safety papers, interpretability posts)\n"
+            "- CEO/CTO interviews: Dario Amodei and Chris Olah public talks, podcasts, conference keynotes\n"
+            "- Partnership announcements: AWS partnership, Google investment disclosures\n"
+            "- Job postings on anthropic.com/careers (reveal what infrastructure they are building)\n"
+            "- Technical papers on arXiv by Anthropic researchers (reveal compute and data needs)\n"
+            "Focus especially on: what COMPUTE do they say they need? What SAFETY INFRASTRUCTURE? What DATA partnerships?"
+        ),
+        "OPENAI": (
+            "- Official blog: openai.com/blog (product launches, research updates, model releases)\n"
+            "- CEO/CTO interviews: Sam Altman podcasts, congressional testimony, Lex Fridman appearances, X posts\n"
+            "- Investor memos and partnership announcements (Microsoft, Oracle, SoftBank deals)\n"
+            "- Job postings on openai.com/careers\n"
+            "- Technical papers and model cards\n"
+            "Focus especially on: what INFRASTRUCTURE CONSTRAINTS does Sam Altman mention? He frequently discusses "
+            "needing more chips, more power, more data centers — find the specific suppliers he signals."
+        ),
+        "XAI": (
+            "- Elon Musk's public posts on X (@elonmusk) about xAI, Grok, Dojo, Neuralink, Starlink\n"
+            "- xAI official announcements: x.ai/blog\n"
+            "- Conference talks and interviews where Musk discusses Grok's compute needs or Dojo architecture\n"
+            "- Partnership and supply announcements for xAI Colossus supercluster\n"
+            "- Job postings on x.ai/careers\n"
+            "Focus especially on: what does Musk say he needs EXTERNALLY for Grok/Dojo/Starlink/Neuralink "
+            "that he cannot source internally from Tesla or SpaceX?"
+        ),
+    }
+
+    hints = lab_hints.get(ticker, (
+        "- Official blog and research publications\n"
+        "- CEO/CTO interviews and conference talks\n"
+        "- Partnership announcements\n"
+        "- Job postings (reveal what they're building)\n"
+        "- Technical papers (reveal infrastructure needs)"
+    ))
+
+    return f"""You are an investment signal extractor. {company} is a PRIVATE AI company (not publicly traded). Your job is to find what {company} NEEDS from external suppliers, partners, and smaller companies — NOT what they build themselves.
+
+Search the internet for {company}'s most recent public statements (last 90 days):
+{hints}
+
+Focus EXCLUSIVELY on signals where {company} reveals:
+1. External technology or components they are BUYING or want to buy more of
+2. Infrastructure BOTTLENECKS — compute, power, cooling, networking that they can't build fast enough
+3. Partnership NEEDS — types of companies they are actively seeking relationships with
+4. R&D BETS on external technology they are funding, testing, or evaluating
+5. Market gaps where they explicitly say smaller specialist companies will win
+
+For each signal, extract EXACTLY this format (do not deviate):
+
+---SIGNAL---
+TYPE: [TECHNOLOGY_GAP|SUPPLY_CHAIN|PARTNERSHIP|CAPACITY|R&D_BET]
+WHAT: [specific technology, component, or capability they need from external partners]
+QUOTE: "[exact quote or close paraphrase — cite the source: blog post title, interview name, date]"
+SPEAKER: [Name, Title, Source]
+BENEFICIARY_TYPE: [specific type of smaller company that would benefit — be precise, e.g. "liquid cooling data center specialist", "custom ASIC designer", "synthetic training data provider"]
+URGENCY: HIGH|MEDIUM|LOW
+---END---
+
+Extract 4-8 signals. Prioritize HIGH urgency signals where the need is explicit and near-term. Skip vague or generic statements.
+
+IMPORTANT: Only surface signals where the beneficiary is a SMALLER EXTERNAL company — not {company} itself, not other big tech firms."""
 
 
 def build_beneficiary_prompt(company: str, signals: list[dict]) -> str:
@@ -339,12 +425,18 @@ def scan(
     verbose: bool = False,
 ) -> dict:
     venice = VeniceClient()
+    is_public = ticker not in TECH_GIANTS_PRIVATE
 
     print_header(company, ticker)
 
     # ── Venice call 1: extract signals ─────────────────────────────────────
-    print(f"{DIM}[1/3] Extracting signals from {company} earnings calls...{RESET}")
-    signal_prompt = build_signal_prompt(ticker, company)
+    source_desc = "earnings calls" if is_public else "blogs / interviews / job postings"
+    print(f"{DIM}[1/3] Extracting signals from {company} {source_desc}...{RESET}")
+    signal_prompt = (
+        build_signal_prompt(ticker, company)
+        if is_public
+        else build_private_lab_signal_prompt(ticker, company)
+    )
     try:
         raw_signals = venice.chat(signal_prompt, web_search=True, max_tokens=2500)
     except Exception as e:
@@ -435,13 +527,19 @@ def main() -> None:
 Examples:
   python3 tools/transcript_scanner.py NVDA
   python3 tools/transcript_scanner.py AMD --add-watchlist
+  python3 tools/transcript_scanner.py OPENAI            # private lab — uses blog/interview sources
+  python3 tools/transcript_scanner.py ANTHROPIC -w      # add HIGH confidence picks to watchlist
+  python3 tools/transcript_scanner.py XAI --verbose
   python3 tools/transcript_scanner.py --list
         """,
     )
     parser.add_argument(
         "ticker",
         nargs="?",
-        help="Tech giant ticker to scan (NVDA, AMD, GOOG, META, MSFT, AAPL, AMZN, TSLA, QCOM, INTC)",
+        help=(
+            "Company to scan. Public: NVDA, AMD, GOOG, META, MSFT, AAPL, AMZN, TSLA, QCOM, INTC. "
+            "Private AI labs: ANTHROPIC, OPENAI, XAI (uses blog/interview/job-posting sources)."
+        ),
     )
     parser.add_argument(
         "--add-watchlist", "-w",
@@ -472,9 +570,13 @@ Examples:
     args = parser.parse_args()
 
     if args.list:
-        print(f"\n{BOLD}Available Tech Giants to Scan:{RESET}")
-        for t, name in TECH_GIANTS.items():
-            print(f"  {CYAN}{t:6}{RESET}  {name}")
+        print(f"\n{BOLD}Available Companies to Scan:{RESET}")
+        print(f"\n  {BOLD}Public (earnings calls / SEC filings):{RESET}")
+        for t, name in TECH_GIANTS_PUBLIC.items():
+            print(f"    {CYAN}{t:6}{RESET}  {name}")
+        print(f"\n  {BOLD}Private AI Labs (blogs / interviews / job postings):{RESET}")
+        for t, name in TECH_GIANTS_PRIVATE.items():
+            print(f"    {CYAN}{t:12}{RESET}  {name}  {DIM}[not publicly traded]{RESET}")
         print()
         return
 
@@ -501,7 +603,10 @@ Examples:
     ticker = args.ticker.upper().strip()
     if ticker not in TECH_GIANTS:
         print(f"{RED}Unknown ticker: {ticker}{RESET}")
-        print(f"Supported: {', '.join(TECH_GIANTS.keys())}")
+        public_list  = ", ".join(TECH_GIANTS_PUBLIC.keys())
+        private_list = ", ".join(TECH_GIANTS_PRIVATE.keys())
+        print(f"Public:  {public_list}")
+        print(f"Private: {private_list}")
         sys.exit(1)
 
     company = TECH_GIANTS[ticker]

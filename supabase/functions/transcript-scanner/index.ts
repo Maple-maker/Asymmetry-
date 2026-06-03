@@ -6,6 +6,7 @@
 //
 // POST {}                      → auto-pick least recently scanned company
 // POST {"company":"NVDA"}      → scan specific company
+// POST {"company":"OPENAI"}    → scan private AI lab (different prompt path)
 // POST {"diag":true}           → diagnostics
 
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
@@ -17,7 +18,14 @@ const NTFY_TOPIC  = "asymmetry-radar";
 const GEMINI_MODEL = "gemini-2.5-flash";
 const GEMINI_BASE  = "https://generativelanguage.googleapis.com/v1beta";
 
-// Tickers to exclude from beneficiary results (the tech giants themselves + common variants)
+// Private AI labs — not publicly traded, so:
+//   1. Different signal extraction prompt (blogs/interviews/job postings vs earnings calls)
+//   2. NOT excluded from beneficiary results (they can never self-refer since they have no ticker)
+const PRIVATE_AI_LABS = new Set(["ANTHROPIC", "OPENAI", "XAI"]);
+
+// Tickers to exclude from beneficiary results (the tech giants themselves + common variants).
+// Private AI labs are intentionally NOT in this list — they're signal sources, not beneficiaries,
+// and their pseudo-tickers (ANTHROPIC, OPENAI, XAI) will never appear in equity research anyway.
 const EXCLUDED_TICKERS = new Set([
   "NVDA","AMD","GOOG","GOOGL","META","AAPL","MSFT","AMZN","TSLA","QCOM","INTC",
 ]);
@@ -29,8 +37,11 @@ const supabase = createClient(
 
 // ── Venice AI (web-search enabled) ────────────────────────────────────────────
 
+// Last Venice error — stored so diag endpoint can surface it
+let lastVeniceError = "";
+
 async function callVenice(prompt: string): Promise<string> {
-  if (!VENICE_KEY) return "";
+  if (!VENICE_KEY) { lastVeniceError = "VENICE_API_KEY not set"; return ""; }
   try {
     const res = await fetch("https://api.venice.ai/api/v1/chat/completions", {
       method: "POST",
@@ -47,14 +58,50 @@ async function callVenice(prompt: string): Promise<string> {
       signal: AbortSignal.timeout(45000),
     });
     if (!res.ok) {
-      console.error(`[venice] ${res.status}: ${(await res.text()).slice(0, 200)}`);
+      const errBody = (await res.text()).slice(0, 400);
+      lastVeniceError = `HTTP ${res.status}: ${errBody}`;
+      console.error(`[venice] ${lastVeniceError}`);
       return "";
     }
+    lastVeniceError = "";
     const data = await res.json();
-    return data.choices?.[0]?.message?.content ?? "";
+    const content = data.choices?.[0]?.message?.content ?? "";
+    console.log(`[venice] response length: ${content.length} chars`);
+    return content;
   } catch (e) {
-    console.error(`[venice] error: ${String(e)}`);
+    lastVeniceError = String(e);
+    console.error(`[venice] error: ${lastVeniceError}`);
     return "";
+  }
+}
+
+// Quick Venice ping — sends a tiny prompt to check connectivity and auth
+async function pingVenice(): Promise<{ ok: boolean; status?: number; error?: string; latency_ms: number }> {
+  if (!VENICE_KEY) return { ok: false, error: "VENICE_API_KEY not set", latency_ms: 0 };
+  const t0 = Date.now();
+  try {
+    const res = await fetch("https://api.venice.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${VENICE_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "kimi-k2-5",
+        messages: [{ role: "user", content: "Reply: OK" }],
+        venice_parameters: { enable_web_search: "off" },
+        max_tokens: 10,
+      }),
+      signal: AbortSignal.timeout(20000),
+    });
+    const latency_ms = Date.now() - t0;
+    if (!res.ok) {
+      const errBody = (await res.text()).slice(0, 300);
+      return { ok: false, status: res.status, error: errBody, latency_ms };
+    }
+    return { ok: true, status: res.status, latency_ms };
+  } catch (e) {
+    return { ok: false, error: String(e), latency_ms: Date.now() - t0 };
   }
 }
 
@@ -116,6 +163,7 @@ interface Signal {
   speaker: string;
   beneficiary_type: string;
   urgency: string;
+  source_url: string;
 }
 
 interface Beneficiary {
@@ -145,12 +193,15 @@ function parseSignals(text: string): Signal[] {
       speaker:          get("SPEAKER"),
       beneficiary_type: get("BENEFICIARY_TYPE"),
       urgency:          get("URGENCY"),
+      source_url:       get("SOURCE_URL"),
     };
     if (sig.what) signals.push(sig);
   }
   return signals;
 }
 
+// Private AI labs are NOT added to EXCLUDED_TICKERS, so their pseudo-tickers won't
+// appear in equity research output and there's no accidental self-reference risk.
 function parseBeneficiaries(text: string, _company: string): Beneficiary[] {
   const beneficiaries: Beneficiary[] = [];
   const blocks = text.split("---COMPANY---").slice(1);
@@ -162,6 +213,10 @@ function parseBeneficiaries(text: string, _company: string): Beneficiary[] {
       return m ? m[1].trim() : "";
     };
     const ticker = get("TICKER").toUpperCase().replace(/[$\s]/g, "");
+    // Exclude public tech giants from beneficiary results.
+    // Private lab pseudo-tickers (ANTHROPIC/OPENAI/XAI) won't realistically appear
+    // in equity research, but even if they did they'd be filtered as non-real tickers
+    // by downstream FMP/market-data lookups.
     if (!ticker || EXCLUDED_TICKERS.has(ticker)) continue;
     const b: Beneficiary = {
       ticker,
@@ -177,7 +232,7 @@ function parseBeneficiaries(text: string, _company: string): Beneficiary[] {
   return beneficiaries;
 }
 
-// ── Signal extraction prompt (Venice call 1) ──────────────────────────────────
+// ── Signal extraction prompt — public companies (earnings calls) ──────────────
 
 function buildSignalPrompt(company: string, ticker: string): string {
   return `You are an investment signal extractor. Your job is to find what ${company} (${ticker}) NEEDS from external suppliers, partners, and smaller companies — NOT what they build themselves.
@@ -204,11 +259,73 @@ QUOTE: "[exact executive quote or close paraphrase with attribution]"
 SPEAKER: [Name, Title]
 BENEFICIARY_TYPE: [specific type of smaller company that would benefit — be precise, e.g. "HBM DRAM manufacturer", "fiber optic transceiver maker", "AI inference chip startup"]
 URGENCY: HIGH|MEDIUM|LOW
+SOURCE_URL: [direct URL to the earnings call transcript, investor day recording, interview, or filing where you found this — be specific]
 ---END---
 
 Extract 4-8 signals. Prioritize HIGH urgency signals where the need is explicit and the beneficiary type is specific and investable. Skip vague or generic statements.
 
 IMPORTANT: Only surface signals where the beneficiary is a SMALLER EXTERNAL company — not ${company} itself, not other tech giants.`;
+}
+
+// ── Signal extraction prompt — private AI labs (blogs/interviews/job postings) ─
+
+function buildPrivateLabSignalPrompt(companyName: string, ticker: string): string {
+  // Tailor the source hints and focus areas per lab
+  const labHints: Record<string, string> = {
+    ANTHROPIC: `- Official research blog: anthropic.com/research (model cards, safety papers, interpretability posts)
+- CEO/CTO interviews: Dario Amodei and Chris Olah public talks, podcasts, conference keynotes
+- Partnership announcements: AWS partnership, Google investment disclosures
+- Job postings on anthropic.com/careers (reveal what infrastructure they are building)
+- Technical papers on arXiv by Anthropic researchers (reveal compute and data needs)
+Focus especially on: what COMPUTE do they say they need? What SAFETY INFRASTRUCTURE? What DATA partnerships?`,
+
+    OPENAI: `- Official blog: openai.com/blog (product launches, research updates, model releases)
+- CEO/CTO interviews: Sam Altman podcasts, congressional testimony, Lex Fridman appearances, X posts
+- Investor memos and partnership announcements (Microsoft, Oracle, SoftBank deals)
+- Job postings on openai.com/careers
+- Technical papers and model cards
+Focus especially on: what INFRASTRUCTURE CONSTRAINTS does Sam Altman mention? He frequently discusses needing more chips, more power, more data centers — find the specific suppliers he signals.`,
+
+    XAI: `- Elon Musk's public posts on X (@elonmusk) about xAI, Grok, Dojo, Neuralink, Starlink
+- xAI official announcements: x.ai/blog
+- Conference talks and interviews where Musk discusses Grok's compute needs or Dojo architecture
+- Partnership and supply announcements for xAI Colossus supercluster
+- Job postings on x.ai/careers
+Focus especially on: what does Musk say he needs EXTERNALLY for Grok/Dojo/Starlink/Neuralink that he cannot source internally from Tesla or SpaceX?`,
+  };
+
+  const hints = labHints[ticker] ?? `- Official blog and research publications
+- CEO/CTO interviews and conference talks
+- Partnership announcements
+- Job postings (reveal what they're building)
+- Technical papers (reveal infrastructure needs)`;
+
+  return `You are an investment signal extractor. ${companyName} is a PRIVATE AI company (not publicly traded). Your job is to find what ${companyName} NEEDS from external suppliers, partners, and smaller companies — NOT what they build themselves.
+
+Search the internet for ${companyName}'s most recent public statements (last 90 days):
+${hints}
+
+Focus EXCLUSIVELY on signals where ${companyName} reveals:
+1. External technology or components they are BUYING or want to buy more of
+2. Infrastructure BOTTLENECKS — compute, power, cooling, networking that they can't build fast enough
+3. Partnership NEEDS — types of companies they are actively seeking relationships with
+4. R&D BETS on external technology they are funding, testing, or evaluating
+5. Market gaps where they explicitly say smaller specialist companies will win
+
+For each signal, extract EXACTLY this format (do not deviate):
+
+---SIGNAL---
+TYPE: [TECHNOLOGY_GAP|SUPPLY_CHAIN|PARTNERSHIP|CAPACITY|R&D_BET]
+WHAT: [specific technology, component, or capability they need from external partners]
+QUOTE: "[exact quote or close paraphrase — cite the source: blog post title, interview name, date]"
+SPEAKER: [Name, Title, Source]
+BENEFICIARY_TYPE: [specific type of smaller company that would benefit — be precise, e.g. "liquid cooling data center specialist", "custom ASIC designer", "synthetic training data provider"]
+URGENCY: HIGH|MEDIUM|LOW
+---END---
+
+Extract 4-8 signals. Prioritize HIGH urgency signals where the need is explicit and near-term. Skip vague or generic statements.
+
+IMPORTANT: Only surface signals where the beneficiary is a SMALLER EXTERNAL company — not ${companyName} itself, not other big tech firms.`;
 }
 
 // ── Beneficiary search prompt (Venice call 2) ─────────────────────────────────
@@ -287,19 +404,23 @@ Output a brief synthesis (300-400 words) covering:
 
 // ── Main scan logic ───────────────────────────────────────────────────────────
 
-async function runScan(ticker: string, company: string): Promise<{
+async function runScan(ticker: string, company: string, isPublic: boolean): Promise<{
   scanId: number;
   signals: Signal[];
   beneficiaries: Beneficiary[];
   synthesis: string;
   addedToWatchlist: string[];
 }> {
-  console.log(`[scanner] Starting scan: ${company} (${ticker})`);
+  console.log(`[scanner] Starting scan: ${company} (${ticker}) | public=${isPublic}`);
 
   // ── Venice call 1: extract signals ────────────────────────────────────────
-  const signalPrompt = buildSignalPrompt(company, ticker);
-  const rawSignals   = await callVenice(signalPrompt);
-  const signals      = parseSignals(rawSignals);
+  // Use a different prompt for private AI labs — they don't have earnings calls
+  const signalPrompt = isPublic
+    ? buildSignalPrompt(company, ticker)
+    : buildPrivateLabSignalPrompt(company, ticker);
+
+  const rawSignals = await callVenice(signalPrompt);
+  const signals    = parseSignals(rawSignals);
   console.log(`[scanner] ${ticker}: extracted ${signals.length} signals`);
 
   // ── Venice call 2: find beneficiaries ─────────────────────────────────────
@@ -325,7 +446,7 @@ async function runScan(ticker: string, company: string): Promise<{
     .from("tech_signal_scans")
     .insert({
       company: ticker,
-      event_type: "auto",
+      event_type: isPublic ? "auto" : "private_lab",
       raw_extraction: [rawSignals, rawBeneficiaries].filter(Boolean).join("\n\n---BENEFICIARIES---\n\n"),
       signals_json: signals as unknown as Record<string, unknown>[],
       opportunities_found: beneficiaries.length,
@@ -404,6 +525,7 @@ function formatNotification(
   beneficiaries: Beneficiary[],
   addedToWatchlist: string[],
   synthesis: string,
+  isPublic: boolean,
 ): { title: string; message: string } {
   const highConf  = beneficiaries.filter(b => b.confidence === "HIGH");
   const medConf   = beneficiaries.filter(b => b.confidence === "MEDIUM");
@@ -413,14 +535,19 @@ function formatNotification(
   const topPickMatch = synthesis.match(/TOP PICK:\s*([A-Z]+)\s*[—-]/);
   const topPick = topPickMatch ? topPickMatch[1] : (highConf[0]?.ticker ?? "");
 
-  const title = `📡 Tech Signal: ${company} → ${beneficiaries.length} plays found`;
+  const labTag = isPublic ? "" : " 🔒";
+  const title = `📡 Tech Signal: ${company}${labTag} → ${beneficiaries.length} plays found`;
 
   const lines: string[] = [
-    `📡 TECH GIANT SIGNAL SCAN — ${company} (${ticker})`,
+    `📡 TECH GIANT SIGNAL SCAN — ${company} (${ticker})${labTag}`,
     "━".repeat(32),
     "",
     `🎯 SIGNALS DETECTED: ${signals.length} (${highSigs.length} HIGH urgency)`,
   ];
+
+  if (!isPublic) {
+    lines.push(`ℹ️  Source: public blog posts, interviews, job postings (private company)`);
+  }
 
   if (highSigs.length > 0) {
     for (const s of highSigs.slice(0, 3)) {
@@ -480,7 +607,7 @@ Deno.serve(async (req: Request) => {
     // Check DB tables
     const { data: watchlist } = await supabase
       .from("tech_giant_watchlist")
-      .select("ticker, last_scanned, scan_priority")
+      .select("ticker, last_scanned, scan_priority, is_public")
       .order("scan_priority", { ascending: false });
     diag.tech_giant_watchlist = watchlist;
 
@@ -488,6 +615,9 @@ Deno.serve(async (req: Request) => {
       .from("tech_signal_scans")
       .select("id", { count: "exact", head: true });
     diag.scan_count = count;
+
+    // Venice connectivity test
+    diag.venice_ping = await pingVenice();
 
     if (GEMINI_KEY) {
       try {
@@ -513,22 +643,24 @@ Deno.serve(async (req: Request) => {
   }
 
   // ── Resolve which company to scan ─────────────────────────────────────────
-  let ticker  = (body.company ?? "").toUpperCase().trim();
-  let company = "";
+  let ticker   = (body.company ?? "").toUpperCase().trim();
+  let company  = "";
+  let isPublic = true;
 
   if (ticker) {
-    // Specific company requested
+    // Specific company requested — look up name and is_public flag
     const { data: row } = await supabase
       .from("tech_giant_watchlist")
-      .select("name")
+      .select("name, is_public")
       .eq("ticker", ticker)
       .single();
-    company = row?.name ?? ticker;
+    company  = row?.name ?? ticker;
+    isPublic = row?.is_public ?? !PRIVATE_AI_LABS.has(ticker);
   } else {
     // Auto-pick: least recently scanned active company by priority
     const { data: rows } = await supabase
       .from("tech_giant_watchlist")
-      .select("ticker, name")
+      .select("ticker, name, is_public")
       .eq("active", true)
       .order("last_scanned", { ascending: true, nullsFirst: true })
       .order("scan_priority", { ascending: false })
@@ -540,16 +672,17 @@ Deno.serve(async (req: Request) => {
         { status: 400, headers: { "Content-Type": "application/json" } },
       );
     }
-    ticker  = rows[0].ticker;
-    company = rows[0].name;
+    ticker   = rows[0].ticker;
+    company  = rows[0].name;
+    isPublic = rows[0].is_public ?? !PRIVATE_AI_LABS.has(ticker);
   }
 
-  console.log(`[scanner] Scanning: ${company} (${ticker})`);
+  console.log(`[scanner] Scanning: ${company} (${ticker}) | is_public=${isPublic}`);
 
   // ── Run the scan ──────────────────────────────────────────────────────────
   let result: Awaited<ReturnType<typeof runScan>>;
   try {
-    result = await runScan(ticker, company);
+    result = await runScan(ticker, company, isPublic);
   } catch (e) {
     console.error(`[scanner] runScan failed: ${String(e)}`);
     return new Response(
@@ -563,7 +696,7 @@ Deno.serve(async (req: Request) => {
   // ── Send ntfy notification ────────────────────────────────────────────────
   if (beneficiaries.length > 0) {
     const { title, message } = formatNotification(
-      company, ticker, signals, beneficiaries, addedToWatchlist, synthesis,
+      company, ticker, signals, beneficiaries, addedToWatchlist, synthesis, isPublic,
     );
     await notify(title, message, 3);
   }
@@ -573,11 +706,13 @@ Deno.serve(async (req: Request) => {
       ok: true,
       company,
       ticker,
+      is_public: isPublic,
       scan_id: scanId,
       signals_found: signals.length,
       beneficiaries_found: beneficiaries.length,
       added_to_watchlist: addedToWatchlist,
       synthesis_length: synthesis.length,
+      ...(lastVeniceError ? { venice_error: lastVeniceError } : {}),
     }, null, 2),
     { headers: { "Content-Type": "application/json" } },
   );
