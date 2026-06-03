@@ -927,7 +927,19 @@ Deno.serve(async (req) => {
       .sort((a, b) => b.scores.overall - a.scores.overall);
 
     const winner = ranked[0];
+    const MIN_SCORE = 75;
     console.log(`[debate] winner: ${winner.candidate.ticker} (${winner.scores.overall.toFixed(0)}/100)`);
+
+    if (winner.scores.overall < MIN_SCORE) {
+      console.log(`[debate] top score ${winner.scores.overall.toFixed(0)} < ${MIN_SCORE} — skipping debate, no notification`);
+      return Response.json({
+        status: "below_threshold",
+        threshold: MIN_SCORE,
+        top_score: winner.scores.overall,
+        winner: winner.candidate.ticker,
+        all_ranked: ranked.map(r => ({ ticker: r.candidate.ticker, score: r.scores.overall.toFixed(0) })),
+      });
+    }
 
     // 5. Run Gemini vs DeepSeek debate on the winner
     console.log("[debate] running bull vs bear debate...");
