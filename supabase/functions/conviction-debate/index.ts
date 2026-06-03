@@ -1,0 +1,865 @@
+// Function: conviction-debate | Project: jmtkygwvmrolfvwueggs
+// Schedule: daily at 9:30 AM UTC via pg_cron (30 9 * * *)
+// Purpose: score HIGH-confidence beneficiaries from today's transcript scan,
+//          run Gemini (bull) vs DeepSeek (bear) debate, pick best candidate,
+//          run full deep analysis, fire 5-message ntfy report + vault push.
+//
+// POST {}              → process today's scan (auto-detect latest)
+// POST {"scan_id": N}  → process a specific scan
+// POST {"diag": true}  → diagnostics only
+
+import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+import { createClient } from "jsr:@supabase/supabase-js@2";
+
+const DEEPSEEK_KEY  = Deno.env.get("DEEPSEEK_API_KEY");
+const GEMINI_KEY    = Deno.env.get("GEMINI_API_KEY");
+const FMP_KEY       = Deno.env.get("FMP_API_KEY");
+const NTFY_TOPIC    = "asymmetry-radar";
+const GEMINI_MODEL  = "gemini-2.5-flash";
+const GEMINI_BASE   = "https://generativelanguage.googleapis.com/v1beta";
+const GITHUB_TOKEN  = Deno.env.get("GITHUB_TOKEN");
+const GITHUB_REPO   = "maple-maker/asymmetry-";
+const GITHUB_BRANCH = "claude/opportunity-radar-research-s0VHQ";
+
+const supabase = createClient(
+  Deno.env.get("SUPABASE_URL")!,
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
+);
+
+// ── LLM callers ───────────────────────────────────────────────────────────────
+
+async function callGemini(prompt: string, timeoutMs = 90000): Promise<string> {
+  if (!GEMINI_KEY) return "";
+  try {
+    const res = await fetch(
+      `${GEMINI_BASE}/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_KEY}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          generationConfig: { thinkingConfig: { thinkingBudget: 0 } },
+          contents: [{ parts: [{ text: prompt }] }],
+        }),
+        signal: AbortSignal.timeout(timeoutMs),
+      },
+    );
+    if (!res.ok) { console.error(`[gemini] HTTP ${res.status}`); return ""; }
+    const data = await res.json();
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+    console.log(`[gemini] ${text.length} chars`);
+    return text;
+  } catch (e) {
+    console.error(`[gemini] ${String(e)}`);
+    return "";
+  }
+}
+
+async function callDeepSeek(prompt: string, timeoutMs = 60000): Promise<string> {
+  if (!DEEPSEEK_KEY) return "";
+  try {
+    const res = await fetch("https://api.deepseek.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${DEEPSEEK_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "deepseek-chat",
+        messages: [{ role: "user", content: prompt }],
+        max_tokens: 2000,
+        temperature: 0.3,
+      }),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!res.ok) { console.error(`[deepseek] HTTP ${res.status}`); return ""; }
+    const data = await res.json();
+    const text = data.choices?.[0]?.message?.content ?? "";
+    console.log(`[deepseek] ${text.length} chars`);
+    return text;
+  } catch (e) {
+    console.error(`[deepseek] ${String(e)}`);
+    return "";
+  }
+}
+
+async function callLLM(prompt: string): Promise<string> {
+  if (DEEPSEEK_KEY) {
+    const r = await callDeepSeek(prompt);
+    if (r) return r;
+  }
+  return callGemini(prompt);
+}
+
+// ── ntfy ──────────────────────────────────────────────────────────────────────
+
+async function notify(title: string, body: string, priority = 4): Promise<void> {
+  try {
+    await fetch("https://ntfy.sh/", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ topic: NTFY_TOPIC, title, message: body, priority, tags: ["brain"] }),
+    });
+  } catch (e) { console.error(`[ntfy] ${String(e)}`); }
+}
+
+// ── FMP live data ─────────────────────────────────────────────────────────────
+
+interface FMPSnapshot {
+  ticker: string;
+  price: number;
+  mktCap: number;
+  pe: number | null;
+  eps: number | null;
+  evToEbitda: number | null;
+  psRatioTTM: number | null;
+  pfcfRatioTTM: number | null;
+  grossMarginTTM: number | null;
+  revenueGrowthTTM: number | null;
+  analystCount: number | null;
+  description: string;
+  sector: string;
+  industry: string;
+  beta: number | null;
+}
+
+async function getFMPSnapshot(ticker: string): Promise<FMPSnapshot | null> {
+  if (!FMP_KEY) return null;
+  try {
+    const [profileRes, metricsRes] = await Promise.all([
+      fetch(`https://financialmodelingprep.com/api/v3/profile/${ticker}?apikey=${FMP_KEY}`, { signal: AbortSignal.timeout(15000) }),
+      fetch(`https://financialmodelingprep.com/api/v3/key-metrics-ttm/${ticker}?apikey=${FMP_KEY}`, { signal: AbortSignal.timeout(15000) }),
+    ]);
+    const profileData = profileRes.ok ? await profileRes.json() : [];
+    const metricsData = metricsRes.ok ? await metricsRes.json() : [];
+    const p = Array.isArray(profileData) ? profileData[0] : null;
+    const m = Array.isArray(metricsData) ? metricsData[0] : null;
+    if (!p) return null;
+    return {
+      ticker,
+      price:             p.price ?? 0,
+      mktCap:            p.mktCap ?? 0,
+      pe:                p.pe ?? m?.peRatioTTM ?? null,
+      eps:               p.eps ?? null,
+      evToEbitda:        m?.evToEbitdaTTM ?? null,
+      psRatioTTM:        m?.priceToSalesRatioTTM ?? null,
+      pfcfRatioTTM:      m?.priceToFreeCashFlowsRatioTTM ?? null,
+      grossMarginTTM:    m?.grossProfitMarginTTM ?? null,
+      revenueGrowthTTM:  m?.revenueGrowthTTM ?? null,
+      analystCount:      null,
+      description:       p.description ?? "",
+      sector:            p.sector ?? "",
+      industry:          p.industry ?? "",
+      beta:              p.beta ?? null,
+    };
+  } catch (e) {
+    console.error(`[fmp:${ticker}] ${String(e)}`);
+    return null;
+  }
+}
+
+// ── Conviction scoring (batch) ────────────────────────────────────────────────
+
+interface ConvictionScores {
+  asymmetry: number;   // 1-10: reward/risk ratio
+  conviction: number;  // 1-10: quality of evidence
+  catalyst: number;    // 1-10: binary, near-term, high-impact
+  management: number;  // 1-10: track record, alignment
+  overall: number;     // 0-100 weighted
+  tier: number;        // 1=Exceptional, 2=High, 3=Watch
+  targetPrice: number | null;
+  floorPrice: number | null;
+  upsidePct: number | null;
+  downsidePct: number | null;
+}
+
+interface Candidate {
+  ticker: string;
+  name: string;
+  thesis: string;
+  sourceCompany: string;
+  signalTheme: string;
+  confidence: string;
+  catalyst: string;
+  snap: FMPSnapshot | null;
+}
+
+function progressBar(score: number, max = 10): string {
+  const filled = Math.round((score / max) * 8);
+  return "█".repeat(filled) + "░".repeat(8 - filled);
+}
+
+async function batchScoreCandidates(candidates: Candidate[]): Promise<Map<string, ConvictionScores>> {
+  const blocks = candidates.map((c, i) => {
+    const price = c.snap?.price ?? 0;
+    return `CANDIDATE ${i + 1}: ${c.ticker} (${c.name})
+Source signal: ${c.sourceCompany} — ${c.signalTheme}
+Thesis: ${c.thesis}
+Current price: $${price.toFixed(2)}
+Catalyst: ${c.catalyst}
+Confidence level from scanner: ${c.confidence}`;
+  }).join("\n\n");
+
+  const prompt = `You are a hedge fund analyst scoring investment candidates on four dimensions.
+
+${blocks}
+
+For EACH candidate, output exactly this format (one block per candidate):
+
+TICKER: [ticker]
+ASYMMETRY: [1-10]
+CONVICTION: [1-10]
+CATALYST_STRENGTH: [1-10]
+MANAGEMENT: [1-10]
+TARGET_PRICE: [$XX or N/A]
+FLOOR_PRICE: [$XX or N/A]
+TIER: [1=10x+ potential | 2=3-10x potential | 3=watch]
+RATIONALE: [2 sentences max]
+---
+
+Scoring guide:
+- Asymmetry (1-10): How lopsided is upside vs downside? 10 = massive upside, tiny downside.
+- Conviction (1-10): Quality and specificity of evidence. 10 = primary source quotes, hard data.
+- Catalyst Strength (1-10): How binary, near-term, high-impact? 10 = specific event within 6 months.
+- Management (1-10): Track record, insider alignment, capital discipline. Use your knowledge.
+- Target price = realistic bull case in 18 months. Floor = bear case if thesis fails.
+- Tier 1 requires ALL four scores ≥ 8. Tier 2 requires overall ≥ 65.`;
+
+  const raw = await callLLM(prompt);
+  const scores = new Map<string, ConvictionScores>();
+
+  const blocks2 = raw.split("---").map(b => b.trim()).filter(b => b.includes("TICKER:"));
+  for (const block of blocks2) {
+    const get = (key: string) => {
+      const m = block.match(new RegExp(`^${key}:\\s*(.+)`, "im"));
+      return m ? m[1].trim() : "";
+    };
+    const ticker = get("TICKER").toUpperCase().replace(/[$\s]/g, "");
+    if (!ticker) continue;
+
+    const asym  = parseInt(get("ASYMMETRY"))  || 5;
+    const conv  = parseInt(get("CONVICTION")) || 5;
+    const cat   = parseInt(get("CATALYST_STRENGTH")) || 5;
+    const mgmt  = parseInt(get("MANAGEMENT")) || 5;
+    const overall = Math.round(asym * 30 + conv * 25 + cat * 25 + mgmt * 20) / 10;
+    const tier  = parseInt(get("TIER")) || 3;
+
+    const parsePrice = (s: string): number | null => {
+      const m = s.match(/[\d.]+/);
+      return m ? parseFloat(m[0]) : null;
+    };
+
+    const currentPrice = candidates.find(c => c.ticker === ticker)?.snap?.price ?? 0;
+    let targetPrice = parsePrice(get("TARGET_PRICE"));
+    let floorPrice  = parsePrice(get("FLOOR_PRICE"));
+    const upsidePct  = targetPrice && currentPrice ? Math.round(((targetPrice - currentPrice) / currentPrice) * 100) : null;
+    const downsidePct = floorPrice && currentPrice ? Math.round(((currentPrice - floorPrice) / currentPrice) * 100) : null;
+
+    scores.set(ticker, { asymmetry: asym, conviction: conv, catalyst: cat, management: mgmt, overall, tier, targetPrice, floorPrice, upsidePct, downsidePct });
+  }
+  return scores;
+}
+
+// ── Gemini vs DeepSeek debate ─────────────────────────────────────────────────
+
+interface DebateResult {
+  bullCase: string;
+  bearCase: string;
+  synthesis: string;
+  verdict: "BULL" | "BEAR" | "NEUTRAL";
+  marketMiss: string;
+  invalidationTrigger: string;
+}
+
+async function runDebate(candidate: Candidate, scores: ConvictionScores): Promise<DebateResult> {
+  const context = `
+Company: ${candidate.name} (${candidate.ticker})
+Source signal: ${candidate.sourceCompany} — ${candidate.signalTheme}
+Thesis: ${candidate.thesis}
+Catalyst: ${candidate.catalyst}
+Price: $${candidate.snap?.price?.toFixed(2) ?? "N/A"} | Market cap: $${candidate.snap ? (candidate.snap.mktCap / 1e6).toFixed(0) + "M" : "N/A"}
+P/E: ${candidate.snap?.pe?.toFixed(1) ?? "N/A"} | EV/EBITDA: ${candidate.snap?.evToEbitda?.toFixed(1) ?? "N/A"}
+Gross margin: ${candidate.snap?.grossMarginTTM ? (candidate.snap.grossMarginTTM * 100).toFixed(1) + "%" : "N/A"}
+Revenue growth YoY: ${candidate.snap?.revenueGrowthTTM ? (candidate.snap.revenueGrowthTTM * 100).toFixed(1) + "%" : "N/A"}`.trim();
+
+  const bullPrompt = `You are a high-conviction equity analyst making the bull case for ${candidate.ticker}.
+${context}
+
+Build the strongest possible bull case. Be specific — use data, supply chain logic, and market dynamics.
+What does the market not understand? What is the magnitude of the opportunity?
+Format:
+MARKET_MISS: [one sentence — the core thing the market has wrong]
+BULL_CASE: [3-4 punchy paragraphs — evidence, upside drivers, why now]
+PRICE_TARGET: [$XX in 18 months with key assumption]`;
+
+  const bearPrompt = `You are a skeptical short-seller stress-testing the thesis on ${candidate.ticker}.
+${context}
+
+Attack the bull case ruthlessly. Find the 3 most damaging weaknesses.
+What would make this thesis completely wrong? What risks are being underpriced?
+Format:
+BEAR_CASE: [3-4 punchy paragraphs — execution risk, competition, valuation, downside]
+INVALIDATION_TRIGGER: [exact condition that would break the thesis — be specific, e.g. "revenue miss >20% for 2 consecutive quarters"]
+WORST_CASE: [$XX in 18 months and why]`;
+
+  // Run bull and bear in parallel
+  const [bullRaw, bearRaw] = await Promise.all([
+    callGemini(bullPrompt, 60000),
+    callDeepSeek(bearPrompt, 50000),
+  ]);
+
+  // If DeepSeek not available, run Gemini for bear too
+  const bearFinal = bearRaw || await callGemini(bearPrompt.replace("short-seller", "skeptical analyst"), 60000);
+
+  const synthPrompt = `You are the chief investment officer adjudicating a debate about ${candidate.ticker}.
+
+BULL CASE (Gemini):
+${bullRaw || "(no bull case generated)"}
+
+BEAR CASE (DeepSeek):
+${bearFinal || "(no bear case generated)"}
+
+Based on this debate, provide your verdict:
+VERDICT: BULL|BEAR|NEUTRAL
+MARKET_MISS: [the single most overlooked insight — one sentence]
+INVALIDATION_TRIGGER: [exact condition that breaks the thesis — one sentence, be specific]
+SYNTHESIS: [2 sentences — who made the stronger argument and why]`;
+
+  const synthRaw = await callGemini(synthPrompt, 45000);
+
+  const get = (key: string, text: string) => {
+    const m = text.match(new RegExp(`^${key}:\\s*(.+)`, "im"));
+    return m ? m[1].trim() : "";
+  };
+
+  const verdictStr = get("VERDICT", synthRaw).toUpperCase();
+  const verdict = (verdictStr === "BULL" || verdictStr === "BEAR") ? verdictStr as "BULL" | "BEAR" : "NEUTRAL";
+  const marketMiss = get("MARKET_MISS", synthRaw) || get("MARKET_MISS", bullRaw);
+  const invalidation = get("INVALIDATION_TRIGGER", synthRaw) || get("INVALIDATION_TRIGGER", bearFinal);
+
+  return {
+    bullCase: bullRaw,
+    bearCase: bearFinal,
+    synthesis: get("SYNTHESIS", synthRaw) || synthRaw.slice(0, 300),
+    verdict,
+    marketMiss,
+    invalidationTrigger: invalidation,
+  };
+}
+
+// ── Deep analysis ─────────────────────────────────────────────────────────────
+
+interface DeepAnalysis {
+  businessModel: string;
+  moat: string;
+  competitors: string[];
+  catalysts: string;
+  bearFlags: string;
+  peerTable: string;
+}
+
+async function runDeepAnalysis(candidate: Candidate): Promise<DeepAnalysis> {
+  const context = `Company: ${candidate.name} (${candidate.ticker})
+Sector signal source: ${candidate.sourceCompany}
+Thesis: ${candidate.thesis}
+Catalyst: ${candidate.catalyst}`;
+
+  const bmMoatPrompt = `Analyze ${candidate.name} (${candidate.ticker}).
+${context}
+
+BUSINESS_MODEL: [2-3 sentences in plain English — how they actually make money, revenue streams, customer concentration, contract structure]
+
+TOP_COMPETITORS: [Competitor1] | [Competitor2] | [Competitor3]
+
+MOAT: [2-3 sentences — does ${candidate.ticker} have a durable edge that rivals cannot copy in 3-5 years? Name it precisely: patent portfolio, switching costs, network effects, proprietary data, or cost structure.]`;
+
+  const catalystBearPrompt = `Analyze ${candidate.name} (${candidate.ticker}) for upcoming catalysts and risks.
+${context}
+
+CATALYSTS:
+① [catalyst] — [timing]
+② [catalyst] — [timing]
+③ [catalyst] — [timing]
+
+RED_FLAG_1_SEVERITY: HIGH|MEDIUM|LOW
+RED_FLAG_1: [description] — Source: [filing/date]
+RED_FLAG_2_SEVERITY: HIGH|MEDIUM|LOW
+RED_FLAG_2: [description] — Source: [filing/date]
+RED_FLAG_3_SEVERITY: HIGH|MEDIUM|LOW
+RED_FLAG_3: [description] — Source: [filing/date]
+
+BEAR_VERDICT: [Does the bull thesis hold given these risks? One sentence.]
+
+PEER_TABLE: Compare ${candidate.ticker} vs its two closest competitors on: P/S TTM | P/FCF | EV/EBITDA | Gross Margin | YoY Revenue Growth
+Format as: METRIC | ${candidate.ticker} | PEER1 | PEER2`;
+
+  // Run both in parallel
+  const [bmMoatRaw, catalystBearRaw] = await Promise.all([
+    callLLM(bmMoatPrompt),
+    callGemini(catalystBearPrompt, 70000),
+  ]);
+
+  const get = (key: string, text: string) => {
+    const m = text.match(new RegExp(`^${key}:\\s*(.+)`, "im"));
+    return m ? m[1].trim() : "";
+  };
+
+  const competitorStr = get("TOP_COMPETITORS", bmMoatRaw);
+  const competitors = competitorStr.split("|").map(s => s.trim()).filter(Boolean);
+
+  return {
+    businessModel: get("BUSINESS_MODEL", bmMoatRaw),
+    moat:          get("MOAT", bmMoatRaw),
+    competitors,
+    catalysts:     catalystBearRaw.match(/CATALYSTS:([\s\S]*?)(?=RED_FLAG_1|$)/i)?.[1]?.trim() ?? "",
+    bearFlags:     catalystBearRaw,
+    peerTable:     catalystBearRaw.match(/PEER_TABLE:([\s\S]*?)$/i)?.[1]?.trim() ?? "",
+  };
+}
+
+// ── 5-message ntfy notification ───────────────────────────────────────────────
+
+function buildProgressBar(score: number, max = 10): string {
+  const filled = Math.round((score / max) * 8);
+  return "█".repeat(filled) + "░".repeat(8 - filled);
+}
+
+async function sendFiveMessages(
+  candidate: Candidate,
+  scores: ConvictionScores,
+  debate: DebateResult,
+  analysis: DeepAnalysis,
+  vaultPath: string,
+): Promise<void> {
+  const t = candidate.ticker;
+  const price = candidate.snap?.price?.toFixed(2) ?? "N/A";
+  const tier = scores.tier === 1 ? "TIER 1 — EXCEPTIONAL" : scores.tier === 2 ? "TIER 2 — HIGH CONVICTION" : "TIER 3 — WATCH";
+  const tierEmoji = scores.tier === 1 ? "🔺" : scores.tier === 2 ? "🟡" : "⚪";
+  const verdictEmoji = debate.verdict === "BULL" ? "🟢 BULL WINS" : debate.verdict === "BEAR" ? "🔴 BEAR WINS" : "🟡 NEUTRAL";
+
+  // ── Message 1: Alert ──────────────────────────────────────────────────────
+  const msg1 = [
+    `${tierEmoji} ${tier} — $${t}  |  ${candidate.name}`,
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    "",
+    "📌 THESIS",
+    candidate.thesis.slice(0, 200),
+    "",
+    "💰 ASYMMETRY",
+    `  Entry:    $${price}`,
+    scores.targetPrice ? `  Target:   $${scores.targetPrice}  (+${scores.upsidePct ?? "?"}%)` : "  Target:   See report",
+    scores.floorPrice  ? `  Floor:    $${scores.floorPrice}  (-${scores.downsidePct ?? "?"}%)` : "  Floor:    See report",
+    "  Horizon:  12–18 months",
+    "",
+    "📊 CONVICTION SCORES",
+    `  Asymmetry      ${buildProgressBar(scores.asymmetry)}  ${scores.asymmetry}/10`,
+    `  Conviction     ${buildProgressBar(scores.conviction)}  ${scores.conviction}/10`,
+    `  Catalyst       ${buildProgressBar(scores.catalyst)}  ${scores.catalyst}/10`,
+    `  Management     ${buildProgressBar(scores.management)}  ${scores.management}/10`,
+    `  ─────────────────────────────`,
+    `  OVERALL        ${scores.overall.toFixed(0)}/100`,
+    "",
+    "🤺 DEBATE",
+    `  ${verdictEmoji}`,
+    `  ${debate.synthesis.slice(0, 180)}`,
+    "",
+    "⚡ CATALYST",
+    `  ${candidate.catalyst.slice(0, 150)}`,
+    "",
+    "🎯 MARKET MISS",
+    `  ${debate.marketMiss.slice(0, 180)}`,
+    "",
+    "→ 4 more messages incoming.",
+  ].join("\n");
+
+  // ── Message 2: Business Model & Moat ─────────────────────────────────────
+  const snap = candidate.snap;
+  const fmtNum = (n: number | null, suffix = "", dec = 1) =>
+    n != null ? `${n.toFixed(dec)}${suffix}` : "N/A";
+  const mktCapStr = snap ? (snap.mktCap >= 1e9 ? `$${(snap.mktCap / 1e9).toFixed(1)}B` : `$${(snap.mktCap / 1e6).toFixed(0)}M`) : "N/A";
+
+  const msg2 = [
+    `📊 $${t} — Business Model & Moat`,
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    "",
+    "HOW THEY MAKE MONEY",
+    analysis.businessModel || "(see vault report)",
+    "",
+    "KEY METRICS",
+    `  Price:         $${price}`,
+    `  Market Cap:    ${mktCapStr}`,
+    `  P/E (TTM):     ${fmtNum(snap?.pe ?? null)}`,
+    `  EV/EBITDA:     ${fmtNum(snap?.evToEbitda ?? null)}`,
+    `  P/S (TTM):     ${fmtNum(snap?.psRatioTTM ?? null)}`,
+    `  P/FCF:         ${fmtNum(snap?.pfcfRatioTTM ?? null)}`,
+    `  Gross Margin:  ${snap?.grossMarginTTM ? (snap.grossMarginTTM * 100).toFixed(1) + "%" : "N/A"}`,
+    `  Rev Growth:    ${snap?.revenueGrowthTTM ? (snap.revenueGrowthTTM * 100).toFixed(1) + "%" : "N/A"}`,
+    "",
+    "MOAT",
+    `  Top rivals: ${analysis.competitors.join(" · ") || "see report"}`,
+    analysis.moat || "(see vault report)",
+  ].join("\n");
+
+  // ── Message 3: Catalysts & Asymmetry ─────────────────────────────────────
+  const msg3 = [
+    `⚡ $${t} — Catalysts (Next 12 Months)`,
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    "",
+    analysis.catalysts || "(see vault report)",
+    "",
+    "DEBATE DEEP-DIVE",
+    "┌─────────────────────────────────┐",
+    `│ GEMINI (BULL)                   │`,
+    `│ ${debate.bullCase.slice(0, 120).replace(/\n/g, " ")}...`,
+    "├─────────────────────────────────┤",
+    `│ DEEPSEEK (BEAR)                 │`,
+    `│ ${debate.bearCase.slice(0, 120).replace(/\n/g, " ")}...`,
+    "├─────────────────────────────────┤",
+    `│ VERDICT: ${verdictEmoji.padEnd(25)}│`,
+    "└─────────────────────────────────┘",
+    "",
+    "ASYMMETRY",
+    scores.targetPrice ? `  Bull:  $${scores.targetPrice}  (+${scores.upsidePct ?? "?"}%)` : "  Bull:  See vault report",
+    scores.floorPrice  ? `  Bear:  $${scores.floorPrice}  (-${scores.downsidePct ?? "?"}%)` : "  Bear:  See vault report",
+  ].join("\n");
+
+  // ── Message 4: Peer comparison ────────────────────────────────────────────
+  const msg4 = [
+    `📐 $${t} vs Peers`,
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    "",
+    `Metric          $${t.padEnd(8)} Peer 1     Peer 2`,
+    "──────────────────────────────────────────────",
+    `P/S (TTM)       ${fmtNum(snap?.psRatioTTM ?? null).padEnd(10)}`,
+    `P/FCF           ${fmtNum(snap?.pfcfRatioTTM ?? null).padEnd(10)}`,
+    `EV/EBITDA       ${fmtNum(snap?.evToEbitda ?? null).padEnd(10)}`,
+    `Gross Margin    ${snap?.grossMarginTTM ? (snap.grossMarginTTM * 100).toFixed(1) + "%" : "N/A"}`,
+    `Rev Growth      ${snap?.revenueGrowthTTM ? (snap.revenueGrowthTTM * 100).toFixed(1) + "%" : "N/A"}`,
+    "",
+    analysis.peerTable ? `LLM COMPARISON\n${analysis.peerTable.slice(0, 500)}` : "",
+  ].join("\n");
+
+  // ── Message 5: Bear case ──────────────────────────────────────────────────
+  const bearFlagsRaw = analysis.bearFlags;
+  const getFlag = (n: number) => {
+    const sev = (bearFlagsRaw.match(new RegExp(`RED_FLAG_${n}_SEVERITY:\\s*(.+)`, "i"))?.[1] ?? "MEDIUM").trim();
+    const desc = (bearFlagsRaw.match(new RegExp(`RED_FLAG_${n}:\\s*(.+)`, "i"))?.[1] ?? "").trim();
+    const sevEmoji = sev === "HIGH" ? "🔴" : sev === "LOW" ? "🟢" : "🟡";
+    return `${sevEmoji} RED FLAG #${n} — [${sev}]\n  ${desc.slice(0, 200)}`;
+  };
+  const bearVerdict = (bearFlagsRaw.match(/BEAR_VERDICT:\s*(.+)/i)?.[1] ?? "").trim();
+
+  const msg5 = [
+    `🐻 $${t} — Bear Case`,
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    "",
+    getFlag(1),
+    "",
+    getFlag(2),
+    "",
+    getFlag(3),
+    "",
+    "VERDICT",
+    bearVerdict || debate.synthesis.slice(0, 200),
+    "",
+    "⚠️ INVALIDATION TRIGGER",
+    debate.invalidationTrigger || "(see vault report)",
+    "",
+    vaultPath ? `📁 VAULT\n   ${vaultPath}` : "",
+  ].filter(l => l !== undefined).join("\n");
+
+  // Send all 5 messages sequentially (ntfy ordering)
+  const priority = scores.tier === 1 ? 5 : 4;
+  await notify(`${tierEmoji} ${t} — Alert [1/5]`, msg1, priority);
+  await notify(`📊 ${t} — Business Model [2/5]`, msg2, 3);
+  await notify(`⚡ ${t} — Catalysts + Debate [3/5]`, msg3, 3);
+  await notify(`📐 ${t} — Peer Comparison [4/5]`, msg4, 3);
+  await notify(`🐻 ${t} — Bear Case [5/5]`, msg5, 3);
+}
+
+// ── GitHub vault push ─────────────────────────────────────────────────────────
+
+async function pushVault(path: string, content: string): Promise<string> {
+  if (!GITHUB_TOKEN) return "";
+  try {
+    const apiUrl = `https://api.github.com/repos/${GITHUB_REPO}/contents/${path}`;
+    const existingRes = await fetch(apiUrl + `?ref=${GITHUB_BRANCH}`, {
+      headers: {
+        "Authorization": `Bearer ${GITHUB_TOKEN}`,
+        "Accept": "application/vnd.github.v3+json",
+        "User-Agent": "asymmetry-radar",
+      },
+      signal: AbortSignal.timeout(10000),
+    });
+    const existing = existingRes.ok ? await existingRes.json() : null;
+    const encoded = btoa(unescape(encodeURIComponent(content)));
+    const body: Record<string, string> = {
+      message: `conviction-debate: ${path}`,
+      content: encoded,
+      branch: GITHUB_BRANCH,
+    };
+    if (existing?.sha) body.sha = existing.sha;
+    const putRes = await fetch(apiUrl, {
+      method: "PUT",
+      headers: {
+        "Authorization": `Bearer ${GITHUB_TOKEN}`,
+        "Accept": "application/vnd.github.v3+json",
+        "Content-Type": "application/json",
+        "User-Agent": "asymmetry-radar",
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!putRes.ok) {
+      console.error(`[github] PUT ${putRes.status}: ${(await putRes.text()).slice(0, 200)}`);
+      return "";
+    }
+    console.log(`[github] pushed ${path}`);
+    return path;
+  } catch (e) {
+    console.error(`[github] ${String(e)}`);
+    return "";
+  }
+}
+
+function generateDebateReport(
+  candidate: Candidate,
+  scores: ConvictionScores,
+  debate: DebateResult,
+  analysis: DeepAnalysis,
+): string {
+  const snap = candidate.snap;
+  const fmtNum = (n: number | null, suffix = "", dec = 1) => n != null ? `${n.toFixed(dec)}${suffix}` : "N/A";
+  const mktCapStr = snap ? (snap.mktCap >= 1e9 ? `$${(snap.mktCap / 1e9).toFixed(1)}B` : `$${(snap.mktCap / 1e6).toFixed(0)}M`) : "N/A";
+  const date = new Date().toISOString().slice(0, 10);
+
+  return `# Conviction Debate Report: ${candidate.ticker} — ${date}
+
+**Source signal:** ${candidate.sourceCompany} → ${candidate.signalTheme}
+**Debate verdict:** ${debate.verdict} | **Overall score:** ${scores.overall.toFixed(0)}/100 | **Tier:** ${scores.tier}
+
+---
+
+## BLUF
+${debate.marketMiss}
+
+---
+
+## Conviction Scores
+
+| Dimension | Score | Bar |
+|---|---|---|
+| Asymmetry | ${scores.asymmetry}/10 | ${buildProgressBar(scores.asymmetry)} |
+| Conviction | ${scores.conviction}/10 | ${buildProgressBar(scores.conviction)} |
+| Catalyst Strength | ${scores.catalyst}/10 | ${buildProgressBar(scores.catalyst)} |
+| Management Quality | ${scores.management}/10 | ${buildProgressBar(scores.management)} |
+| **Overall** | **${scores.overall.toFixed(0)}/100** | |
+
+Entry: $${snap?.price?.toFixed(2) ?? "N/A"} | Target: ${scores.targetPrice ? `$${scores.targetPrice}` : "N/A"} | Floor: ${scores.floorPrice ? `$${scores.floorPrice}` : "N/A"}
+
+---
+
+## Gemini — Bull Case
+
+${debate.bullCase || "(not generated)"}
+
+---
+
+## DeepSeek — Bear Case
+
+${debate.bearCase || "(not generated)"}
+
+---
+
+## Synthesis Verdict
+
+${debate.synthesis}
+
+**Verdict:** ${debate.verdict}
+
+**Invalidation trigger:** ${debate.invalidationTrigger}
+
+---
+
+## Business Model
+
+${analysis.businessModel}
+
+**Top competitors:** ${analysis.competitors.join(" | ")}
+
+## Moat
+
+${analysis.moat}
+
+---
+
+## Catalysts (Next 12 Months)
+
+${analysis.catalysts}
+
+---
+
+## Financial Snapshot
+
+| Metric | Value |
+|---|---|
+| Price | $${snap?.price?.toFixed(2) ?? "N/A"} |
+| Market Cap | ${mktCapStr} |
+| P/E (TTM) | ${fmtNum(snap?.pe ?? null)} |
+| EV/EBITDA | ${fmtNum(snap?.evToEbitda ?? null)} |
+| P/S (TTM) | ${fmtNum(snap?.psRatioTTM ?? null)} |
+| P/FCF | ${fmtNum(snap?.pfcfRatioTTM ?? null)} |
+| Gross Margin | ${snap?.grossMarginTTM ? (snap.grossMarginTTM * 100).toFixed(1) + "%" : "N/A"} |
+| Rev Growth YoY | ${snap?.revenueGrowthTTM ? (snap.revenueGrowthTTM * 100).toFixed(1) + "%" : "N/A"} |
+| Beta | ${snap?.beta?.toFixed(2) ?? "N/A"} |
+| Sector | ${snap?.sector ?? "N/A"} |
+
+---
+
+## Bear Case — 3 Red Flags
+
+${analysis.bearFlags}
+
+---
+
+## Peer Comparison
+
+${analysis.peerTable}
+
+---
+
+*Generated by conviction-debate · ${new Date().toISOString()}*
+`;
+}
+
+// ── Main handler ──────────────────────────────────────────────────────────────
+
+Deno.serve(async (req) => {
+  const body = req.method === "POST" ? await req.json().catch(() => ({})) : {};
+
+  if (body.diag) {
+    return Response.json({
+      deepseek_key: !!DEEPSEEK_KEY,
+      gemini_key: !!GEMINI_KEY,
+      fmp_key: !!FMP_KEY,
+      github_token: !!GITHUB_TOKEN,
+    });
+  }
+
+  try {
+    // 1. Fetch candidates from today's scan (or specified scan_id)
+    let query = supabase
+      .from("signal_opportunities")
+      .select("*")
+      .order("created_at", { ascending: false })
+      .limit(20);
+
+    if (body.scan_id) {
+      query = query.eq("scan_id", body.scan_id);
+    } else {
+      // Default: last 3 hours (catches 9 AM scan when running at 9:30 AM)
+      const cutoff = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
+      query = query.gte("created_at", cutoff);
+    }
+
+    const { data: rows, error } = await query;
+    if (error) throw new Error(`DB fetch: ${error.message}`);
+
+    let candidates = (rows ?? []).filter(r => r.confidence === "HIGH");
+    if (candidates.length === 0) {
+      candidates = (rows ?? []).filter(r => r.confidence === "MEDIUM");
+    }
+    if (candidates.length === 0) {
+      return Response.json({ status: "no_candidates", message: "No candidates found in recent scans. Run transcript-scanner first." });
+    }
+
+    // De-duplicate by ticker (keep first/highest confidence)
+    const seen = new Set<string>();
+    const unique = candidates.filter(r => {
+      const t = r.beneficiary_ticker?.toUpperCase();
+      if (!t || seen.has(t)) return false;
+      seen.add(t);
+      return true;
+    });
+
+    console.log(`[debate] ${unique.length} unique candidates: ${unique.map(r => r.beneficiary_ticker).join(", ")}`);
+
+    // 2. Fetch FMP snapshots in parallel for all candidates
+    const snapMap = new Map<string, FMPSnapshot | null>();
+    await Promise.all(unique.map(async r => {
+      const snap = await getFMPSnapshot(r.beneficiary_ticker);
+      snapMap.set(r.beneficiary_ticker, snap);
+    }));
+
+    // 3. Build Candidate objects
+    const candidateObjs: Candidate[] = unique.map(r => ({
+      ticker:       r.beneficiary_ticker,
+      name:         r.beneficiary_name,
+      thesis:       r.thesis,
+      sourceCompany: r.source_company,
+      signalTheme:  r.signal_theme || "",
+      confidence:   r.confidence,
+      catalyst:     r.catalyst || "",
+      snap:         snapMap.get(r.beneficiary_ticker) ?? null,
+    }));
+
+    // 4. Batch score all candidates
+    console.log("[debate] batch scoring...");
+    const scoreMap = await batchScoreCandidates(candidateObjs);
+
+    // Sort by overall score, pick winner
+    const ranked = candidateObjs
+      .map(c => ({ candidate: c, scores: scoreMap.get(c.ticker) ?? { asymmetry: 5, conviction: 5, catalyst: 5, management: 5, overall: 50, tier: 3, targetPrice: null, floorPrice: null, upsidePct: null, downsidePct: null } }))
+      .sort((a, b) => b.scores.overall - a.scores.overall);
+
+    const winner = ranked[0];
+    console.log(`[debate] winner: ${winner.candidate.ticker} (${winner.scores.overall.toFixed(0)}/100)`);
+
+    // 5. Run Gemini vs DeepSeek debate on the winner
+    console.log("[debate] running bull vs bear debate...");
+    const debate = await runDebate(winner.candidate, winner.scores);
+    console.log(`[debate] verdict: ${debate.verdict}`);
+
+    // 6. Deep analysis (parallel LLM calls)
+    console.log("[debate] running deep analysis...");
+    const analysis = await runDeepAnalysis(winner.candidate);
+
+    // 7. Push vault report
+    const date = new Date().toISOString().slice(0, 10);
+    const vaultPathTarget = `vault/debates/${winner.candidate.ticker}_${date}.md`;
+    const md = generateDebateReport(winner.candidate, winner.scores, debate, analysis);
+    const vaultPath = await pushVault(vaultPathTarget, md);
+
+    // 8. Send 5-message ntfy report
+    console.log("[debate] sending ntfy report...");
+    await sendFiveMessages(winner.candidate, winner.scores, debate, analysis, vaultPath);
+
+    // 9. Persist result to DB
+    await supabase.from("conviction_debates").insert({
+      ticker:           winner.candidate.ticker,
+      company_name:     winner.candidate.name,
+      source_scan_id:   unique[0]?.scan_id ?? null,
+      overall_score:    winner.scores.overall,
+      tier:             winner.scores.tier,
+      debate_verdict:   debate.verdict,
+      market_miss:      debate.marketMiss,
+      invalidation:     debate.invalidationTrigger,
+      vault_path:       vaultPath || null,
+      all_candidates:   ranked.map(r => ({ ticker: r.candidate.ticker, score: r.scores.overall })),
+    }).then(({ error: e }) => { if (e) console.warn(`[db] insert warning: ${e.message}`); });
+
+    return Response.json({
+      status: "ok",
+      winner: winner.candidate.ticker,
+      overall_score: winner.scores.overall,
+      tier: winner.scores.tier,
+      verdict: debate.verdict,
+      market_miss: debate.marketMiss,
+      vault_path: vaultPath || null,
+      all_ranked: ranked.map(r => ({ ticker: r.candidate.ticker, score: r.scores.overall.toFixed(0) })),
+    });
+
+  } catch (e) {
+    console.error(`[debate] fatal: ${String(e)}`);
+    return Response.json({ status: "error", error: String(e) }, { status: 500 });
+  }
+});
