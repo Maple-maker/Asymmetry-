@@ -1,2 +1,4 @@
 asymmetry.db
 .env
+*.pyc
+__pycache__/
