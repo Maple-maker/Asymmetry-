@@ -1,0 +1,186 @@
+{% extends "base.html" %}
+{% block title %}{{ recipe.title or 'Recipe' }} — Asymmetry{% endblock %}
+
+{% block content %}
+
+<div style="margin-bottom:1rem;">
+  <a href="/" style="color:var(--muted); text-decoration:none; font-size:.875rem;">← Library</a>
+</div>
+
+<!-- Hero -->
+<div class="card" style="margin-bottom:1.25rem; overflow:hidden;">
+  {% if recipe.thumbnail_url %}
+  <img src="{{ recipe.thumbnail_url }}" style="width:100%; height:220px; object-fit:cover;" onerror="this.style.display='none'">
+  {% endif %}
+  <div style="padding:1.25rem 1.5rem;">
+    <h1 style="font-size:1.4rem; font-weight:700; margin-bottom:.5rem;">
+      {{ recipe.title or 'Untitled recipe' }}
+    </h1>
+    <div style="display:flex; gap:1rem; flex-wrap:wrap; font-size:.82rem; color:var(--muted); margin-bottom:1rem;">
+      {% if recipe.total_time_minutes %}<span>⏱ {{ recipe.total_time_minutes }} min</span>{% endif %}
+      {% if recipe.servings %}<span>🍽 {{ recipe.servings }} servings</span>{% endif %}
+      <span>📎 {{ recipe.source_platform }}</span>
+      {% if recipe.source_url %}<a href="{{ recipe.source_url }}" target="_blank" style="color:var(--accent);">View source ↗</a>{% endif %}
+    </div>
+
+    {% if recipe.status == 'pending' or recipe.status == 'processing' %}
+    <div style="color:var(--muted); font-size:.875rem;">⏳ Still parsing — refresh in a moment.</div>
+    {% elif recipe.status == 'error' %}
+    <div style="background:#fff0f0; border:1px solid #fcc; border-radius:8px; padding:.75rem; font-size:.875rem; color:#c0392b;">
+      ⚠️ Parsing failed: {{ recipe.parse_error or 'unknown error' }}<br>
+      <span style="color:var(--muted);">The raw content was saved. You can edit ingredients manually.</span>
+    </div>
+    {% endif %}
+
+    <!-- Action buttons -->
+    <div style="display:flex; gap:.6rem; flex-wrap:wrap; margin-top:.75rem;">
+      {% if recipe.status == 'ready' %}
+      <button class="btn btn-green" onclick="markCooked({{ recipe.id }})">✓ Cooked it!</button>
+      {% endif %}
+      <a href="/shopping?add={{ recipe.id }}" class="btn btn-ghost btn-sm">+ Shopping list</a>
+      <button class="btn btn-ghost btn-sm" onclick="showReminderForm()">🔔 Set reminder</button>
+    </div>
+  </div>
+</div>
+
+<!-- Cook log -->
+{% if cook_logs %}
+<div style="margin-bottom:1.25rem; display:flex; gap:.5rem; align-items:center;">
+  <span class="tag tag-green">Cooked {{ cook_logs|length }}×</span>
+  <span style="font-size:.8rem; color:var(--muted);">Last: {{ cook_logs[0].cooked_at[:10] }}</span>
+  <button class="btn btn-ghost btn-sm" onclick="undoCook({{ recipe.id }})" style="margin-left:.5rem;">↩ Undo</button>
+</div>
+{% endif %}
+
+<!-- Reminder form (hidden) -->
+<div id="reminder-form" class="card" style="display:none; padding:1.25rem; margin-bottom:1.25rem;">
+  <div style="font-weight:700; margin-bottom:1rem;">Set a reminder</div>
+  <div style="display:grid; grid-template-columns:1fr 1fr; gap:1rem;">
+    <div class="form-row">
+      <label>Type</label>
+      <select id="r-type">
+        <option value="cook">Cook this recipe</option>
+        <option value="prep">Prep / defrost</option>
+        <option value="shop">Go shopping</option>
+      </select>
+    </div>
+    <div class="form-row">
+      <label>When</label>
+      <input type="datetime-local" id="r-time">
+    </div>
+  </div>
+  <div class="form-row">
+    <label>Note (optional)</label>
+    <input type="text" id="r-note" placeholder="e.g. take chicken out first">
+  </div>
+  <button class="btn btn-primary btn-sm" onclick="saveReminder({{ recipe.id }})">Save reminder</button>
+  <button class="btn btn-ghost btn-sm" onclick="document.getElementById('reminder-form').style.display='none'">Cancel</button>
+</div>
+
+<!-- Existing reminders -->
+{% if reminders %}
+<div style="margin-bottom:1.25rem;">
+  {% for r in reminders %}
+  <div style="display:flex; align-items:center; gap:.75rem; padding:.6rem 0; border-bottom:1px solid var(--border); font-size:.875rem;">
+    <span>🔔</span>
+    <span style="font-weight:600;">{{ r.type|capitalize }}</span>
+    <span style="color:var(--muted);">{{ r.remind_at[:16].replace('T',' ') }}</span>
+    {% if r.note %}<span style="color:var(--muted);">— {{ r.note }}</span>{% endif %}
+    <button class="btn btn-ghost btn-sm" onclick="deleteReminder({{ r.id }})" style="margin-left:auto;">✕</button>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+
+<div style="display:grid; grid-template-columns:1fr 1fr; gap:1.25rem;">
+
+  <!-- Ingredients -->
+  {% if ingredients %}
+  <div class="card" style="padding:1.25rem;">
+    <div style="font-weight:700; margin-bottom:1rem;">Ingredients</div>
+    {% set current_aisle = namespace(val='') %}
+    {% for ing in ingredients %}
+      {% if ing.aisle != current_aisle.val %}
+        {% set current_aisle.val = ing.aisle %}
+        <div style="font-size:.72rem; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:.06em; margin: .9rem 0 .4rem;">{{ ing.aisle }}</div>
+      {% endif %}
+      <div style="display:flex; gap:.5rem; padding:.3rem 0; font-size:.9rem; border-bottom:1px solid var(--border);">
+        <span style="color:var(--accent); font-family:var(--mono); min-width:3.5rem; font-size:.85rem;">
+          {% if ing.qty %}{{ ing.qty|int if ing.qty == ing.qty|int else ing.qty }}{% endif %}
+          {% if ing.unit %}{{ ing.unit }}{% endif %}
+        </span>
+        <span>{{ ing.item }}{% if ing.prep %}, <em style="color:var(--muted);">{{ ing.prep }}</em>{% endif %}</span>
+      </div>
+    {% endfor %}
+  </div>
+  {% endif %}
+
+  <!-- Steps -->
+  {% if steps %}
+  <div class="card" style="padding:1.25rem;">
+    <div style="font-weight:700; margin-bottom:1rem;">Steps</div>
+    {% for step in steps %}
+    <div style="display:flex; gap:.75rem; margin-bottom:1rem; font-size:.9rem;">
+      <div style="font-family:var(--mono); font-weight:700; color:var(--accent); min-width:1.4rem; padding-top:.05rem;">{{ step.step_number }}</div>
+      <div style="line-height:1.5;">{{ step.instruction }}</div>
+    </div>
+    {% endfor %}
+  </div>
+  {% endif %}
+
+</div>
+
+{% if not ingredients and not steps and recipe.status == 'ready' %}
+<div class="card empty">
+  <div>No ingredients or steps were extracted. <a href="{{ recipe.source_url }}" target="_blank">View the original source</a>.</div>
+</div>
+{% endif %}
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+function showReminderForm() {
+  const f = document.getElementById('reminder-form');
+  f.style.display = f.style.display === 'none' ? 'block' : 'none';
+  // Default to tomorrow same time
+  const d = new Date(); d.setDate(d.getDate() + 1);
+  document.getElementById('r-time').value = d.toISOString().slice(0,16);
+}
+
+async function saveReminder(recipeId) {
+  const type = document.getElementById('r-type').value;
+  const time = document.getElementById('r-time').value;
+  const note = document.getElementById('r-note').value;
+  if (!time) { alert('Pick a time'); return; }
+
+  await fetch('/api/reminders', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ recipe_id: recipeId, type, remind_at: time, note: note || null })
+  });
+  location.reload();
+}
+
+async function deleteReminder(id) {
+  await fetch(`/api/reminders/${id}`, { method: 'DELETE' });
+  location.reload();
+}
+
+async function markCooked(recipeId) {
+  const rating = prompt('Quick rating? (1–5, or leave blank)');
+  await fetch('/api/cook', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ recipe_id: recipeId, rating: rating ? parseInt(rating) : null })
+  });
+  location.reload();
+}
+
+async function undoCook(recipeId) {
+  if (!confirm('Remove most recent cook log?')) return;
+  await fetch(`/api/cook/${recipeId}/last`, { method: 'DELETE' });
+  location.reload();
+}
+</script>
+{% endblock %}

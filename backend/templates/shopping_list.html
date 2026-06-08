@@ -1,0 +1,90 @@
+{% extends "base.html" %}
+{% block title %}{{ lst.name or 'Shopping list' }} — Asymmetry{% endblock %}
+
+{% block content %}
+
+<div style="margin-bottom:1rem;">
+  <a href="/shopping" style="color:var(--muted); text-decoration:none; font-size:.875rem;">← Shopping</a>
+</div>
+
+<div style="display:flex; align-items:baseline; gap:1rem; margin-bottom:1.5rem;">
+  <h2 style="font-size:1.3rem; font-weight:700;">{{ lst.name or 'Shopping list' }}</h2>
+  <span style="font-size:.8rem; color:var(--muted);">{{ lst.created_at[:10] }}</span>
+</div>
+
+<!-- Add item form -->
+<div class="card" style="padding:1rem 1.25rem; margin-bottom:1.25rem;">
+  <div style="display:flex; gap:.75rem; align-items:flex-end;">
+    <div style="flex:.6">
+      <label>Item</label>
+      <input type="text" id="add-item" placeholder="e.g. garlic">
+    </div>
+    <div style="flex:.2">
+      <label>Qty</label>
+      <input type="text" id="add-qty" placeholder="2">
+    </div>
+    <div style="flex:.2">
+      <label>Unit</label>
+      <input type="text" id="add-unit" placeholder="cloves">
+    </div>
+    <button class="btn btn-ghost btn-sm" onclick="addItem({{ lst.id }})" style="flex-shrink:0;">Add</button>
+  </div>
+</div>
+
+{% if ordered_aisles %}
+<div style="display:grid; gap:1.25rem;">
+  {% for aisle, items in ordered_aisles %}
+  <div class="card" style="overflow:hidden;">
+    <div style="padding:.6rem 1.1rem; background:var(--accent-lt); font-size:.75rem; font-weight:700; text-transform:uppercase; letter-spacing:.06em; color:var(--accent);">
+      {{ aisle }}
+    </div>
+    {% for item in items %}
+    <div id="item-{{ item.id }}" style="display:flex; align-items:center; gap:.75rem; padding:.7rem 1.1rem; border-bottom:1px solid var(--border); {% if item.checked %}opacity:.45;{% endif %}">
+      <input type="checkbox" {% if item.checked %}checked{% endif %}
+             onchange="toggleCheck({{ lst.id }}, {{ item.id }}, this)"
+             style="width:18px;height:18px;accent-color:var(--green);cursor:pointer;flex-shrink:0;">
+      <span style="font-family:var(--mono); font-size:.82rem; color:var(--accent); min-width:3.5rem;">
+        {% if item.qty_display %}{{ item.qty_display }} {% endif %}
+        {% if item.unit %}{{ item.unit }}{% endif %}
+      </span>
+      <span style="{% if item.checked %}text-decoration:line-through;{% endif %}">{{ item.item }}</span>
+      {% if item.is_manual %}<span style="margin-left:auto; font-size:.7rem; color:var(--muted);">manual</span>{% endif %}
+    </div>
+    {% endfor %}
+  </div>
+  {% endfor %}
+</div>
+{% else %}
+<div class="card empty">
+  <div class="icon">📝</div>
+  <div>No items yet.</div>
+</div>
+{% endif %}
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function toggleCheck(listId, itemId, checkbox) {
+  const row = document.getElementById(`item-${itemId}`);
+  const res = await fetch(`/api/shopping/${listId}/check/${itemId}`, { method: 'POST' });
+  const data = await res.json();
+  row.style.opacity = data.checked ? '.45' : '1';
+  row.querySelector('span:last-of-type').style.textDecoration = data.checked ? 'line-through' : 'none';
+}
+
+async function addItem(listId) {
+  const item = document.getElementById('add-item').value.trim();
+  const qty = document.getElementById('add-qty').value.trim();
+  const unit = document.getElementById('add-unit').value.trim();
+  if (!item) return;
+
+  const params = new URLSearchParams({ item });
+  if (qty) params.set('qty_display', qty);
+  if (unit) params.set('unit', unit);
+
+  await fetch(`/api/shopping/${listId}/add?${params}`, { method: 'POST' });
+  location.reload();
+}
+</script>
+{% endblock %}

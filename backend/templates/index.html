@@ -1,0 +1,149 @@
+{% extends "base.html" %}
+{% block title %}Asymmetry — Library{% endblock %}
+
+{% block content %}
+
+<!-- Stats row -->
+<div style="display:grid; grid-template-columns: repeat(3,1fr); gap:1rem; margin-bottom:1.5rem;">
+  <div class="card stat-box">
+    <div class="number">{{ cook_rate }}%</div>
+    <div class="label">Cook Rate (30d)</div>
+  </div>
+  <div class="card stat-box">
+    <div class="number">{{ cooked_30 }}</div>
+    <div class="label">Cooked this month</div>
+  </div>
+  <div class="card stat-box">
+    <div class="number">{{ saved_30 }}</div>
+    <div class="label">Saved this month</div>
+  </div>
+</div>
+
+<!-- Capture form -->
+<div class="card" style="padding:1.25rem; margin-bottom:1.5rem;">
+  <div style="font-weight:700; margin-bottom:1rem; font-size:1rem;">Save a recipe</div>
+  <div class="form-row">
+    <label>URL (recipe link, Instagram reel, YouTube video…)</label>
+    <input type="url" id="capture-url" placeholder="https://..." />
+  </div>
+  <div style="color:var(--muted); font-size:0.8rem; text-align:center; margin:.5rem 0;">— or —</div>
+  <div class="form-row">
+    <label>Paste recipe text</label>
+    <textarea id="capture-text" rows="3" placeholder="Paste the recipe caption, ingredients list, or any text…"></textarea>
+  </div>
+  <button class="btn btn-primary" onclick="captureRecipe()">Save recipe</button>
+  <span id="capture-status" style="margin-left:.75rem; font-size:.85rem; color:var(--muted);"></span>
+</div>
+
+<!-- Cook 3 nudge -->
+{% if surfaced %}
+<div style="margin-bottom:1.5rem;">
+  <div style="font-weight:700; margin-bottom:.75rem;">Cook these next 🍳</div>
+  <div style="display:grid; gap:.75rem;">
+    {% for r in surfaced %}
+    <a href="/recipes/{{ r.id }}" style="text-decoration:none;">
+      <div class="card" style="display:flex; align-items:center; gap:1rem; padding:.9rem 1rem;">
+        {% if r.thumbnail_url %}
+        <img src="{{ r.thumbnail_url }}" style="width:56px;height:56px;object-fit:cover;border-radius:6px;flex-shrink:0;" onerror="this.style.display='none'">
+        {% endif %}
+        <div>
+          <div style="font-weight:600; color:var(--text);">{{ r.title or 'Untitled recipe' }}</div>
+          <div style="font-size:.8rem; color:var(--muted);">{{ r.source_platform }} · saved {{ r.created_at[:10] }}</div>
+        </div>
+      </div>
+    </a>
+    {% endfor %}
+  </div>
+</div>
+{% endif %}
+
+<!-- All recipes -->
+<div style="font-weight:700; margin-bottom:.75rem;">All saved recipes ({{ recipes|length }})</div>
+
+{% if recipes %}
+<div style="display:grid; gap:.6rem;">
+  {% for r in recipes %}
+  <a href="/recipes/{{ r.id }}" style="text-decoration:none;">
+    <div class="card" style="display:flex; align-items:center; gap:1rem; padding:.85rem 1rem;">
+      {% if r.thumbnail_url %}
+      <img src="{{ r.thumbnail_url }}" style="width:48px;height:48px;object-fit:cover;border-radius:6px;flex-shrink:0;" onerror="this.style.display='none'">
+      {% endif %}
+      <div style="flex:1; min-width:0;">
+        <div style="font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; color:var(--text);">
+          {{ r.title or r.raw_url or 'Untitled' }}
+        </div>
+        <div style="font-size:.78rem; color:var(--muted);">{{ r.source_platform }} · {{ r.created_at[:10] }}</div>
+      </div>
+      <div>
+        {% if r.status == 'ready' %}
+          {% if r.cook_count > 0 %}<span class="tag tag-green">Cooked ✓</span>{% endif %}
+        {% elif r.status == 'pending' or r.status == 'processing' %}
+          <span class="tag">Parsing…</span>
+        {% elif r.status == 'error' %}
+          <span class="tag" style="background:#fff0f0;color:#c0392b;">Error</span>
+        {% endif %}
+      </div>
+    </div>
+  </a>
+  {% endfor %}
+</div>
+{% else %}
+<div class="card empty">
+  <div class="icon">🥘</div>
+  <div>No recipes saved yet. Paste a URL above to get started.</div>
+</div>
+{% endif %}
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function captureRecipe() {
+  const url = document.getElementById('capture-url').value.trim();
+  const text = document.getElementById('capture-text').value.trim();
+  const status = document.getElementById('capture-status');
+
+  if (!url && !text) { status.textContent = 'Enter a URL or paste text.'; return; }
+
+  status.innerHTML = '<span class="spinner"></span> Saving…';
+
+  const res = await fetch('/api/ingest', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ url: url || null, text: text || null })
+  });
+
+  if (!res.ok) { status.textContent = 'Error saving. Try again.'; return; }
+
+  const data = await res.json();
+  status.textContent = 'Saved! Parsing in background…';
+  document.getElementById('capture-url').value = '';
+  document.getElementById('capture-text').value = '';
+
+  // Poll until ready, then reload
+  pollStatus(data.recipe_id);
+}
+
+async function pollStatus(id) {
+  const status = document.getElementById('capture-status');
+  let attempts = 0;
+  const interval = setInterval(async () => {
+    attempts++;
+    const res = await fetch(`/api/recipes/${id}/status`);
+    const data = await res.json();
+    if (data.status === 'ready') {
+      clearInterval(interval);
+      status.textContent = `"${data.title || 'Recipe'}" ready!`;
+      setTimeout(() => location.reload(), 800);
+    } else if (data.status === 'error') {
+      clearInterval(interval);
+      status.textContent = 'Parsing failed — saved as stub.';
+      setTimeout(() => location.reload(), 1200);
+    } else if (attempts > 30) {
+      clearInterval(interval);
+      status.textContent = 'Still processing — refresh in a moment.';
+    }
+  }, 2000);
+}
+</script>
+{% endblock %}

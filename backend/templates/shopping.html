@@ -1,0 +1,82 @@
+{% extends "base.html" %}
+{% block title %}Shopping — Asymmetry{% endblock %}
+
+{% block content %}
+
+<h2 style="font-size:1.3rem; font-weight:700; margin-bottom:1.25rem;">Shopping lists</h2>
+
+<!-- Build new list -->
+<div class="card" style="padding:1.25rem; margin-bottom:1.5rem;">
+  <div style="font-weight:700; margin-bottom:1rem;">Build a new list</div>
+  {% if ready_recipes %}
+  <div class="form-row">
+    <label>Select recipes (hold Ctrl/Cmd for multiple)</label>
+    <select id="recipe-select" multiple size="{{ [ready_recipes|length, 6]|min }}" style="height:auto;">
+      {% for r in ready_recipes %}
+      <option value="{{ r.id }}" {% if r.id|string in preselect_ids %}selected{% endif %}>
+        {{ r.title or 'Untitled #' + r.id|string }}
+      </option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="form-row">
+    <label>List name (optional)</label>
+    <input type="text" id="list-name" placeholder="e.g. This week's meals">
+  </div>
+  <button class="btn btn-primary" onclick="buildList()">Build shopping list</button>
+  <span id="build-status" style="margin-left:.75rem; font-size:.85rem; color:var(--muted);"></span>
+  {% else %}
+  <div class="empty" style="padding:1.5rem 0;">
+    <div>No ready recipes yet. <a href="/">Save a recipe</a> first.</div>
+  </div>
+  {% endif %}
+</div>
+
+<!-- Existing lists -->
+{% if lists %}
+<div style="font-weight:700; margin-bottom:.75rem;">Saved lists</div>
+<div style="display:grid; gap:.6rem;">
+  {% for lst in lists %}
+  <a href="/shopping/{{ lst.id }}" style="text-decoration:none;">
+    <div class="card" style="padding:.85rem 1.1rem; display:flex; justify-content:space-between; align-items:center;">
+      <div>
+        <div style="font-weight:600; color:var(--text);">{{ lst.name or 'Shopping list' }}</div>
+        <div style="font-size:.78rem; color:var(--muted);">{{ lst.created_at[:10] }}</div>
+      </div>
+      <span style="color:var(--muted); font-size:1.2rem;">›</span>
+    </div>
+  </a>
+  {% endfor %}
+</div>
+{% else %}
+<div class="card empty">
+  <div class="icon">🛒</div>
+  <div>No lists yet. Build one above.</div>
+</div>
+{% endif %}
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function buildList() {
+  const sel = document.getElementById('recipe-select');
+  const ids = [...sel.selectedOptions].map(o => parseInt(o.value));
+  const name = document.getElementById('list-name').value.trim();
+  const status = document.getElementById('build-status');
+
+  if (!ids.length) { status.textContent = 'Select at least one recipe.'; return; }
+  status.textContent = 'Building…';
+
+  const res = await fetch('/api/shopping/build', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ recipe_ids: ids, name: name || null })
+  });
+
+  if (!res.ok) { status.textContent = 'Error building list.'; return; }
+  const data = await res.json();
+  window.location.href = `/shopping/${data.list_id}`;
+}
+</script>
+{% endblock %}
