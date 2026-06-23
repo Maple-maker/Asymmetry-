@@ -4,7 +4,7 @@ import { createClient, type SupabaseClient } from "@supabase/supabase-js";
  * Server-side Supabase client using the SERVICE-ROLE key.
  *
  * SECURITY: this client BYPASSES Row-Level Security and is the only role allowed
- * to read/write `connected_accounts.plaid_access_token` (column SELECT is revoked
+ * to read/write `connected_accounts.snaptrade_user_secret` (column SELECT is revoked
  * from `authenticated`/`anon` in supabase/migrations/0001_init.sql). It must never
  * be exposed to the client and lives only on the server.
  *

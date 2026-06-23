@@ -8,12 +8,10 @@ import { postMemoryExtract } from "./memory-extract.js";
 import { paceStatus } from "./llm.js";
 import { seedDevProUsers } from "./entitlements.js";
 import {
-  postPlaidExchange,
-  postPlaidLinkToken,
-  postPlaidSync,
-  postPlaidWebhook,
-} from "./plaid.js";
-import { postPlaidHoldings } from "./holdings.js";
+  postSnapTradeConnectUrl,
+  postSnapTradeRegister,
+} from "./snaptrade.js";
+import { postSnapTradeHoldings } from "./holdings.js";
 import { postRevenueCatWebhook } from "./webhooks.js";
 import { getMarketQuote, getMarketSearch } from "./market.js";
 import { isMarketLiveSearchEnabled } from "./market-data-guard.js";
@@ -86,11 +84,10 @@ app.get("/v1/market/sentiment", getMarketSentiment);
 app.post("/v1/research/catalysts", postCatalystResearch);
 app.post("/v1/memory/extract", postMemoryExtract);
 app.post("/v1/webhooks/revenuecat", postRevenueCatWebhook);
-app.post("/v1/plaid/link-token", postPlaidLinkToken);
-app.post("/v1/plaid/exchange", postPlaidExchange);
-app.post("/v1/plaid/sync", postPlaidSync);
-app.post("/v1/plaid/holdings", postPlaidHoldings);
-app.post("/v1/webhooks/plaid", postPlaidWebhook);
+// SnapTrade — READ-ONLY brokerage portfolio tracking (no order placement).
+app.post("/v1/snaptrade/register", postSnapTradeRegister);
+app.post("/v1/snaptrade/connect-url", postSnapTradeConnectUrl);
+app.post("/v1/snaptrade/holdings", postSnapTradeHoldings);
 app.post("/v1/mfa/setup", postMfaSetup);
 app.post("/v1/mfa/verify", postMfaVerify);
 app.post("/v1/mfa/challenge", postMfaChallenge);

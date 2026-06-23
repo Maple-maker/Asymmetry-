@@ -52,8 +52,8 @@ supabase db reset       # applies migrations + seed.sql to the local DB
 ### User-owned (RLS: `user_id = auth.uid()`)
 | Table | Purpose | Notes |
 |---|---|---|
-| `connected_accounts` | Plaid institution links (`plaid_item_id`, `plaid_access_token`, `institution`, `status`, `last_synced_at`). | **`plaid_access_token` is service-role only** (see below). |
-| `holdings` | Plaid-ingested positions (read-only). | Server writes; client reads own. |
+| `connected_accounts` | SnapTrade brokerage links (`snaptrade_user_id`, `snaptrade_user_secret`, `snaptrade_authorization_id`, `brokerage`, `status`, `last_synced_at`). | **`snaptrade_user_secret` is service-role only** (see below). |
+| `holdings` | SnapTrade-ingested positions (read-only). | Server writes; client reads own. |
 | `holding_scorecards` | Append-only rubric scorecard per holding/day (`total`, `action`, `category_scores`, `deploy`). | INSERT-only for clients. |
 | `holding_snapshots` | Append-only Radar V2 per-holding snapshot (`radar_score`, `reprice_gap`, `top_signals`). | INSERT-only for clients. |
 | `thesis_matches` | Screener thesis↔ticker matches. | Full own-row CRUD. |
@@ -75,18 +75,18 @@ server for ingest/scoring/writes); the **authenticated** role is constrained by 
     rows); the server (service role) performs all writes.
   - `thesis_matches` allows full own-row CRUD for the client.
 
-### `plaid_access_token` — service-role ONLY (hard rule)
+### `snaptrade_user_secret` — service-role ONLY (hard rule)
 
-The Plaid access token must **never** reach the client. Two layers enforce this:
+The SnapTrade user secret must **never** reach the client. Two layers enforce this:
 
 1. **Column-level grant revoke** — `0001_init.sql` runs
-   `REVOKE SELECT (plaid_access_token) ON public.connected_accounts FROM authenticated, anon;`
-   so even a user reading their own `connected_accounts` row cannot select the token column.
+   `REVOKE SELECT (snaptrade_user_secret) ON public.connected_accounts FROM authenticated, anon;`
+   so even a user reading their own `connected_accounts` row cannot select the secret column.
 2. **Safe view** — `connected_accounts_safe` (`security_invoker`) projects every column **except**
-   `plaid_access_token`. Client code should read from this view.
+   `snaptrade_user_secret`. Client code should read from this view.
 
-The service role bypasses both RLS and column grants, so server-side Plaid sync retains full
-access to the token.
+The service role bypasses both RLS and column grants, so server-side SnapTrade sync retains full
+access to the secret.
 
 ## Compliance notes baked into the schema
 

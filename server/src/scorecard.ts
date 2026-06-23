@@ -1,7 +1,7 @@
 // src/scorecard.ts
 //
 // M3 — the server-side scorecard RUNNER. This is the thin orchestration layer that
-// drives the M1 rubric engine (in `../lib/rubric/`) over a single Plaid holding and
+// drives the M1 rubric engine (in `../lib/rubric/`) over a single linked holding and
 // shapes the result into a row ready to upsert into the `holding_scorecards` table.
 //
 // It does NOT re-implement any rubric math — it only wires the engine's exported
@@ -49,7 +49,7 @@ import { isSupabaseConfigured, getServiceClient } from "./supabase.js";
 /**
  * The slice of a `holdings` row the scorecard runner needs. Mirrors the columns in
  * supabase/migrations/0001_init.sql (`holdings` table). Quantity / cost_basis /
- * market_value are nullable in Plaid feeds, so they are optional here.
+ * market_value are nullable in SnapTrade feeds, so they are optional here.
  *
  * `id` is the holding_id FK; `userId` is the row owner — both flow straight onto the
  * output row so the upsert is RLS-correct.
