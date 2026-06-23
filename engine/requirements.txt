@@ -1,0 +1,15 @@
+# RADAR V2 signal engine — runtime dependencies.
+# Core engine + the two free SEC adapters need only requests + beautifulsoup4.
+# yfinance/pandas power the free price/volume + regime adapters (Yahoo).
+# supabase is OPTIONAL — the writer degrades to a no-op when it is absent or
+# when no credentials are set (see radar_v2/supabase_writer.py).
+
+requests>=2.31
+beautifulsoup4>=4.12
+yfinance>=0.2.40
+pandas>=2.0
+pytest>=8.0
+
+# Optional — only needed to actually write to Supabase (M4 DoD). The engine
+# runs and tests pass without it.
+# supabase>=2.4

@@ -1,0 +1,6 @@
+# Minimal config so `radar_v2` is importable as a top-level package and pytest
+# discovers the ported test modules. Run tests from the engine/ directory:
+#   cd engine && python -m pytest -q
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["radar_v2/tests"]
