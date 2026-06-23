@@ -13,6 +13,7 @@ import {
   postPlaidSync,
   postPlaidWebhook,
 } from "./plaid.js";
+import { postPlaidHoldings } from "./holdings.js";
 import { postRevenueCatWebhook } from "./webhooks.js";
 import { getMarketQuote, getMarketSearch } from "./market.js";
 import { isMarketLiveSearchEnabled } from "./market-data-guard.js";
@@ -88,6 +89,7 @@ app.post("/v1/webhooks/revenuecat", postRevenueCatWebhook);
 app.post("/v1/plaid/link-token", postPlaidLinkToken);
 app.post("/v1/plaid/exchange", postPlaidExchange);
 app.post("/v1/plaid/sync", postPlaidSync);
+app.post("/v1/plaid/holdings", postPlaidHoldings);
 app.post("/v1/webhooks/plaid", postPlaidWebhook);
 app.post("/v1/mfa/setup", postMfaSetup);
 app.post("/v1/mfa/verify", postMfaVerify);

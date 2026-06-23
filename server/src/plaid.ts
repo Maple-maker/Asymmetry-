@@ -13,7 +13,7 @@ function ensureDataDir() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
-function loadTokens(): Record<string, { access_token: string; item_id: string }> {
+export function loadTokens(): Record<string, { access_token: string; item_id: string }> {
   try {
     if (fs.existsSync(TOKENS_PATH)) return JSON.parse(fs.readFileSync(TOKENS_PATH, "utf-8"));
   } catch { /* corrupt file, start fresh */ }
@@ -25,25 +25,25 @@ function saveTokens(tokens: Record<string, { access_token: string; item_id: stri
   fs.writeFileSync(TOKENS_PATH, JSON.stringify(tokens, null, 2));
 }
 
-function getPlaidBase(): string {
+export function getPlaidBase(): string {
   const env = process.env.PLAID_ENV ?? "sandbox";
   if (env === "production") return "https://production.plaid.com";
   if (env === "development") return "https://development.plaid.com";
   return "https://sandbox.plaid.com";
 }
 
-function plaidHeaders() {
+export function plaidHeaders() {
   return { "Content-Type": "application/json" };
 }
 
-function plaidCredentials() {
+export function plaidCredentials() {
   return {
     client_id: process.env.PLAID_CLIENT_ID!,
     secret: process.env.PLAID_SECRET!,
   };
 }
 
-function isPlaidConfigured(): boolean {
+export function isPlaidConfigured(): boolean {
   return !!(process.env.PLAID_CLIENT_ID && process.env.PLAID_SECRET);
 }
 
@@ -77,7 +77,12 @@ export async function postPlaidLinkToken(req: Request, res: Response) {
         ...plaidCredentials(),
         user: { client_user_id: parsed.data.userId },
         client_name: "Thesis",
-        products: ["auth", "transactions", "investments", "liabilities"],
+        // COMPLIANCE (read-only, non-negotiable — see docs/ASYMMETRY-RELEASE-ROADMAP.md
+        // "Compliance constraints" #1): request the `investments` product ONLY.
+        // No `auth` / `transactions` / `liabilities` / `transfer` / `payment_initiation`
+        // scopes — the product never reads bank routing numbers nor places/moves money.
+        // This is the read-only Investments holdings ingest (M2): /investments/holdings/get.
+        products: ["investments"],
         country_codes: ["US"],
         language: "en",
       }),
